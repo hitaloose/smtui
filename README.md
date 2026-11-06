@@ -16,12 +16,12 @@ smtui            # or: smtui /var/www
 
 ## Install
 
-Download a static Linux binary from the [releases](../../releases) page, on the server:
+Download a static Linux binary from the [releases](https://github.com/hitaloose/smtui/releases) page, on the server:
 
 ```sh
 arch=$(uname -m)   # x86_64 or aarch64
 version=v0.1.0
-curl -fsSL "https://github.com/<owner>/smtui/releases/download/${version}/smtui-${version}-${arch}-unknown-linux-musl.tar.gz" \
+curl -fsSL "https://github.com/hitaloose/smtui/releases/download/${version}/smtui-${version}-${arch}-unknown-linux-musl.tar.gz" \
   | tar -xz --strip-components=1 -C ~/.local/bin "smtui-${version}-${arch}-unknown-linux-musl/smtui"
 ```
 
