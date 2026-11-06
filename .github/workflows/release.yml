@@ -63,7 +63,7 @@ jobs:
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           name="smtui-${tag}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
-          cp "target/${{ matrix.target }}/release/smtui" README.md "dist/${name}/"
+          cp "target/${{ matrix.target }}/release/smtui" README.md LICENSE "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
           echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"

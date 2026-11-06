@@ -2,6 +2,12 @@
 name = "smtui"
 version = "0.3.1"
 edition = "2024"
+description = "Server manager TUI that runs on your server inside tmux: terminal tabs and a mouse-friendly file browser"
+repository = "https://github.com/hitaloose/smtui"
+license = "MIT"
+readme = "README.md"
+keywords = ["tui", "terminal", "tmux", "file-manager", "sysadmin"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"

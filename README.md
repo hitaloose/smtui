@@ -152,3 +152,7 @@ The GIF above is recorded with [VHS](https://github.com/charmbracelet/vhs) from 
 
 New modes implement the `Mode` trait in `src/modes/mod.rs` and are registered in `src/main.rs`;
 the tab bar and the bottom bar are generated from the registered modes.
+
+## License
+
+[MIT](LICENSE)
