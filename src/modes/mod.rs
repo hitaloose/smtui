@@ -11,11 +11,55 @@ use std::any::Any;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{Frame, layout::Rect};
 
+use crate::ui::dialog::Confirm;
 use crate::{config::Config, event::AppEvent, event::EventSender, host::HostInfo, ui::theme::Theme};
 
 #[derive(Debug, Clone)]
 pub struct TabInfo {
     pub title: String,
+}
+
+/// A shortcut shown in the bottom bar: the key is drawn as a keycap, then the label and,
+/// for toggles, `● on` / `○ off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyHint {
+    pub key: String,
+    pub label: String,
+    pub state: Option<bool>,
+    pub target: HintTarget,
+}
+
+/// What clicking a hint does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintTarget {
+    None,
+    /// Runs this action through [`Mode::on_action`].
+    Action(u32),
+    /// Opens the app's menu of leader-key shortcuts.
+    Shortcuts,
+}
+
+impl KeyHint {
+    pub fn new(key: impl Into<String>, label: impl Into<String>) -> Self {
+        Self { key: key.into(), label: label.into(), state: None, target: HintTarget::None }
+    }
+
+    #[allow(dead_code)] // API for modes; no current hint is a toggle
+    pub fn toggle(mut self, on: bool) -> Self {
+        self.state = Some(on);
+        self
+    }
+
+    #[allow(dead_code)] // API for modes; no current hint runs a mode action
+    pub fn on_click(mut self, action: u32) -> Self {
+        self.target = HintTarget::Action(action);
+        self
+    }
+
+    pub fn opens_shortcuts(mut self) -> Self {
+        self.target = HintTarget::Shortcuts;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,18 +70,26 @@ pub enum EventResult {
 
 #[derive(Debug, Clone)]
 pub enum MenuItem {
-    Action { label: String, hint: String, enabled: bool, action: u32 },
+    Action { label: String, hint: String, enabled: bool, danger: bool, action: u32 },
     Separator,
 }
 
 impl MenuItem {
     pub fn action(label: impl Into<String>, action: u32) -> Self {
-        MenuItem::Action { label: label.into(), hint: String::new(), enabled: true, action }
+        MenuItem::Action { label: label.into(), hint: String::new(), enabled: true, danger: false, action }
     }
 
     pub fn with_hint(mut self, text: impl Into<String>) -> Self {
         if let MenuItem::Action { hint, .. } = &mut self {
             *hint = text.into();
+        }
+        self
+    }
+
+    /// Draws the item in the danger color (destructive actions).
+    pub fn danger(mut self) -> Self {
+        if let MenuItem::Action { danger, .. } = &mut self {
+            *danger = true;
         }
         self
     }
@@ -54,6 +106,8 @@ impl MenuItem {
 pub enum Effect {
     Toast { msg: String, detail: String },
     OpenMenu { x: u16, y: u16, items: Vec<MenuItem> },
+    /// Modal confirmation; on confirm its `action` comes back through [`Mode::on_action`].
+    Confirm(Confirm),
     /// Offered to every mode; the first one that accepts it becomes the active mode.
     Request(Box<dyn Any>),
 }
@@ -81,9 +135,13 @@ impl<'a> ModeCtx<'a> {
     }
 
     /// Opens a context menu at screen position `(x, y)`; the chosen `action` comes back
-    /// through [`Mode::on_menu_action`].
+    /// through [`Mode::on_action`].
     pub fn open_menu(&mut self, x: u16, y: u16, items: Vec<MenuItem>) {
         self.effects.push(Effect::OpenMenu { x, y, items });
+    }
+
+    pub fn confirm(&mut self, confirm: Confirm) {
+        self.effects.push(Effect::Confirm(confirm));
     }
 
     /// Sends a request (see [`requests`]) to the mode that handles it and switches to that mode.
@@ -120,13 +178,25 @@ pub trait Mode {
     fn handle_app_event(&mut self, _ev: &AppEvent, _ctx: &mut ModeCtx) -> EventResult {
         EventResult::Ignored
     }
-    fn on_menu_action(&mut self, _action: u32, _ctx: &mut ModeCtx) {}
+    /// A context menu item was chosen, or a confirmation dialog was accepted.
+    fn on_action(&mut self, _action: u32, _ctx: &mut ModeCtx) {}
     /// Returns true when the mode handled a request sent by another mode.
     fn handle_request(&mut self, _request: &dyn Any, _ctx: &mut ModeCtx) -> bool {
         false
     }
 
     fn status(&self, shared: &Shared) -> String;
+
+    /// Shortcuts shown as keycaps in the bottom bar, next to the status.
+    fn hints(&self, _shared: &Shared) -> Vec<KeyHint> {
+        Vec::new()
+    }
+
+    /// Extra items for the app's shortcuts menu (after the tab actions); a chosen item
+    /// comes back through [`Mode::on_action`].
+    fn shortcut_items(&self) -> Vec<MenuItem> {
+        Vec::new()
+    }
 
     /// When true, every key goes to the mode (e.g. a terminal); only the leader key
     /// reaches the app's global shortcuts.

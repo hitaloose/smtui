@@ -95,6 +95,33 @@ impl Fs for MemoryFs {
     fn copy_to(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.transfer(from, to, false)
     }
+
+    fn compress(&self, dir: &Path, names: &[std::ffi::OsString], dest: &Path) -> io::Result<()> {
+        let mut dirs = self.dirs.lock().expect("memory fs lock");
+        let (Some(parent), Some(dest_name)) = (dest.parent(), dest.file_name()) else { return Err(not_found(dest)) };
+        let src = dirs.get(dir).ok_or_else(|| not_found(dir))?;
+        // A rough stand-in for the compressed size: a third of the file sizes.
+        let size = src.iter().filter(|e| names.contains(&e.name)).map(|e| e.size.max(4096)).sum::<u64>() / 3;
+        let list = dirs.get_mut(parent).ok_or_else(|| not_found(parent))?;
+        if list.iter().any(|e| e.name == dest_name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", dest.display())));
+        }
+        list.push(Entry { name: dest_name.into(), kind: EntryKind::File, size, modified: Some(SystemTime::now()), symlink: false });
+        Ok(())
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        let mut dirs = self.dirs.lock().expect("memory fs lock");
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return Err(not_found(path)) };
+        let list = dirs.get_mut(parent).ok_or_else(|| not_found(path))?;
+        let before = list.len();
+        list.retain(|e| e.name != name);
+        if list.len() == before {
+            return Err(not_found(path));
+        }
+        dirs.retain(|k, _| !k.starts_with(path));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

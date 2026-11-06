@@ -16,7 +16,7 @@ use ratatui::{
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use self::session::{TermEvent, TerminalSession};
-use super::{EventResult, Mode, ModeCtx, Shared, TabInfo, requests::OpenTerminal};
+use super::{EventResult, KeyHint, Mode, ModeCtx, Shared, TabInfo, requests::OpenTerminal};
 use crate::event::{AppEvent, EventSender};
 
 struct TermTab {
@@ -282,13 +282,11 @@ impl Mode for TerminalMode {
     }
 
     fn status(&self, shared: &Shared) -> String {
-        let n = self.tabs.len();
-        format!(
-            "{} · {n} {} · {} shortcuts · ctrl-q quit",
-            shared.host.label(),
-            if n == 1 { "tab" } else { "tabs" },
-            shared.config.leader
-        )
+        shared.host.label()
+    }
+
+    fn hints(&self, shared: &Shared) -> Vec<KeyHint> {
+        vec![KeyHint::new(crate::keys::display(&shared.config.leader), "Shortcuts").opens_shortcuts()]
     }
 
     fn captures_input(&self) -> bool {

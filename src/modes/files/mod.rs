@@ -22,8 +22,8 @@ use self::{
     tab::FilesTab,
     view::FilesTarget,
 };
-use super::{EventResult, MenuItem, Mode, ModeCtx, Shared, TabInfo, requests::OpenTerminal};
-use crate::{clipboard, event::AppEvent, event::EventSender, ui::hit::HitMap};
+use super::{EventResult, KeyHint, MenuItem, Mode, ModeCtx, Shared, TabInfo, requests::OpenTerminal};
+use crate::{clipboard, event::AppEvent, event::EventSender, ui::dialog::Confirm, ui::hit::HitMap};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
@@ -35,11 +35,25 @@ mod action {
     pub const PASTE_INTO: u32 = 5;
     pub const SCP: u32 = 6;
     pub const TERMINAL: u32 = 7;
+    pub const DELETE: u32 = 8;
+    pub const DELETE_CONFIRMED: u32 = 9;
+    pub const COMPRESS: u32 = 10;
+    pub const TOGGLE_HIDDEN: u32 = 11;
 }
 
 enum FilesEvent {
     Listed { tab_id: u64, request: u64, result: Result<Vec<Entry>, String> },
     Pasted(PasteReport),
+    Deleted(DeleteReport),
+    Compressed { tab_id: u64, dir: PathBuf, result: Result<OsString, String> },
+}
+
+#[derive(Clone)]
+struct DeleteReport {
+    dir: PathBuf,
+    /// (name, is_dir) of the entries that were removed.
+    done: Vec<(OsString, bool)>,
+    errors: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -70,6 +84,10 @@ pub struct FilesMode {
     menu_into: Option<PathBuf>,
     /// Folder that "Open in terminal" targets while the menu is open.
     menu_terminal: Option<PathBuf>,
+    /// Entries waiting for the delete confirmation: (folder, [(name, is_dir)]).
+    pending_delete: Option<(PathBuf, Vec<(OsString, bool)>)>,
+    deleting: bool,
+    compressing: bool,
 }
 
 impl FilesMode {
@@ -89,6 +107,9 @@ impl FilesMode {
             last_click: None,
             menu_into: None,
             menu_terminal: None,
+            pending_delete: None,
+            deleting: false,
+            compressing: false,
         };
         mode.open_tab(start);
         mode
@@ -290,6 +311,146 @@ impl FilesMode {
         ctx.toast(msg, cmd);
     }
 
+    // ---- Delete ----
+
+    /// Asks for confirmation (typing DELETE) before removing the selection.
+    fn ask_delete(&mut self, ctx: &mut ModeCtx) {
+        if self.deleting {
+            ctx.toast("A delete is already running", "");
+            return;
+        }
+        let tab = &self.tabs[self.active];
+        let targets: Vec<(OsString, bool)> = tab.selected_entries().iter().map(|e| (e.name.clone(), e.is_dir())).collect();
+        if targets.is_empty() {
+            return;
+        }
+        let dirs = targets.iter().filter(|(_, d)| *d).count();
+        let what = match (targets.len(), dirs) {
+            (1, 1) => "this folder and everything inside it".to_string(),
+            (1, _) => "this file".to_string(),
+            (n, 0) => format!("these {n} files"),
+            (n, _) => format!("these {n} items (folders with everything inside them)"),
+        };
+        let items = targets
+            .iter()
+            .map(|(n, d)| format!("{}{}", n.to_string_lossy(), if *d { "/" } else { "" }))
+            .collect();
+        ctx.confirm(Confirm {
+            title: format!("Delete {}?", label_for(targets.iter().map(|(n, _)| n))),
+            message: format!("This permanently deletes {what} from {}. It cannot be undone.", tab.path.display()),
+            items,
+            confirm_label: "Delete".into(),
+            danger: true,
+            require_text: Some("DELETE".into()),
+            action: action::DELETE_CONFIRMED,
+        });
+        self.pending_delete = Some((tab.path.clone(), targets));
+    }
+
+    fn delete(&mut self) {
+        let Some((dir, targets)) = self.pending_delete.take() else { return };
+        self.deleting = true;
+        let (fs, tx) = (self.fs.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let mut report = DeleteReport { dir: dir.clone(), done: Vec::new(), errors: Vec::new() };
+            for (name, is_dir) in targets {
+                let path = dir.join(&name);
+                match fs.remove(&path) {
+                    Ok(()) => report.done.push((name, is_dir)),
+                    Err(e) => report.errors.push(format!("{}: {e}", path.display())),
+                }
+            }
+            tx.send(FilesEvent::Deleted(report));
+        });
+    }
+
+    fn finish_delete(&mut self, r: DeleteReport, ctx: &mut ModeCtx) {
+        self.deleting = false;
+        let removed: Vec<PathBuf> = r.done.iter().map(|(n, _)| r.dir.join(n)).collect();
+        // Tabs that were inside a deleted folder go back to its parent.
+        for tab in &mut self.tabs {
+            if removed.iter().any(|p| tab.path.starts_with(p)) {
+                tab.navigate(r.dir.clone());
+            }
+        }
+        // Deleted items leave the copy/move area.
+        if let Some(clip) = &mut self.clip {
+            if removed.iter().any(|p| clip.dir.starts_with(p)) {
+                self.clip = None;
+            } else if clip.dir == r.dir {
+                clip.items.retain(|i| !r.done.iter().any(|(n, _)| *n == i.name));
+                if clip.items.is_empty() {
+                    self.clip = None;
+                }
+            }
+        }
+        let dir = r.dir.clone();
+        self.reload_where(|t| t.path == dir || t.loading);
+
+        let detail = match r.errors.as_slice() {
+            [] => String::new(),
+            [one] => one.clone(),
+            [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
+        };
+        if r.done.is_empty() {
+            ctx.toast("Nothing was deleted", detail);
+        } else {
+            ctx.toast(format!("Deleted: {}", label_for(r.done.iter().map(|(n, _)| n))), detail);
+        }
+    }
+
+    // ---- Compress ----
+
+    fn compress(&mut self, ctx: &mut ModeCtx) {
+        if self.compressing {
+            ctx.toast("A compression is already running", "");
+            return;
+        }
+        let tab = &self.tabs[self.active];
+        let names: Vec<OsString> = tab.selected_entries().iter().map(|e| e.name.clone()).collect();
+        if names.is_empty() {
+            return;
+        }
+        let base = match names.as_slice() {
+            [one] => one.to_string_lossy().into_owned(),
+            _ => tab.title(),
+        };
+        let taken: HashSet<String> = tab.entries.iter().map(|e| e.name.to_string_lossy().into_owned()).collect();
+        let archive = ops::archive_name(&base, &taken);
+        self.compressing = true;
+        ctx.toast(format!("Compressing to {archive}…"), "");
+        let (fs, tx, dir, tab_id) = (self.fs.clone(), self.tx.clone(), tab.path.clone(), tab.id);
+        std::thread::spawn(move || {
+            let dest = dir.join(&archive);
+            let result = fs
+                .compress(&dir, &names, &dest)
+                .map(|()| OsString::from(&archive))
+                .map_err(|e| format!("{archive}: {e}"));
+            tx.send(FilesEvent::Compressed { tab_id, dir, result });
+        });
+    }
+
+    fn finish_compress(&mut self, tab_id: u64, dir: &PathBuf, result: &Result<OsString, String>, ctx: &mut ModeCtx) {
+        self.compressing = false;
+        match result {
+            Ok(name) => {
+                for tab in self.tabs.iter_mut().filter(|t| t.id == tab_id && &t.path == dir) {
+                    tab.select_after_load = Some(BTreeSet::from([name.clone()]));
+                }
+                ctx.toast(format!("Created {}", name.to_string_lossy()), "");
+            }
+            Err(e) => ctx.toast("Could not create the archive", e.clone()),
+        }
+        let dir = dir.clone();
+        self.reload_where(|t| t.path == dir);
+    }
+
+    fn toggle_hidden(&mut self, ctx: &mut ModeCtx) {
+        self.show_hidden = !self.show_hidden;
+        self.reload_where(|_| true);
+        ctx.toast(if self.show_hidden { "Showing hidden files" } else { "Hiding hidden files" }, "Press . to toggle.");
+    }
+
     // ---- Context menu ----
 
     /// `on_item`: the menu was opened on an entry (the selection), not on empty space.
@@ -323,11 +484,16 @@ impl FilesMode {
             };
             items.push(paste.with_hint(paste_hint).enabled(can_paste));
             items.push(MenuItem::Separator);
+            items.push(MenuItem::action("Compress to .tar.gz", action::COMPRESS).with_hint("z").enabled(!self.compressing));
             items.push(MenuItem::action("Copy scp command", action::SCP));
             items.push(match &single_dir {
                 Some(_) => MenuItem::action("Open in terminal", action::TERMINAL),
                 None => MenuItem::action("Open terminal here", action::TERMINAL),
             });
+            items.push(MenuItem::Separator);
+            items.push(
+                MenuItem::action(format!("Delete{suffix}"), action::DELETE).with_hint("Del").danger().enabled(!self.deleting),
+            );
         } else {
             items.push(MenuItem::action("Paste here", action::PASTE_HERE).with_hint(paste_hint).enabled(can_paste));
             items.push(MenuItem::Separator);
@@ -486,7 +652,7 @@ impl Mode for FilesMode {
                 let tab = self.tab();
                 tab.selection = tab.entries.iter().map(|e| e.name.clone()).collect();
             }
-            KeyCode::Menu => self.open_menu_from_keyboard(ctx),
+            KeyCode::Menu | KeyCode::Char('o') => self.open_menu_from_keyboard(ctx),
             KeyCode::F(10) if key.modifiers.contains(KeyModifiers::SHIFT) => self.open_menu_from_keyboard(ctx),
             KeyCode::Char('c') if !ctrl => {
                 self.ensure_selection();
@@ -514,9 +680,14 @@ impl Mode for FilesMode {
                 };
                 ctx.request(OpenTerminal { cwd });
             }
-            KeyCode::Char('.') => {
-                self.show_hidden = !self.show_hidden;
-                self.reload_where(|_| true);
+            KeyCode::Char('.') => self.toggle_hidden(ctx),
+            KeyCode::Char('z') if !ctrl => {
+                self.ensure_selection();
+                self.compress(ctx);
+            }
+            KeyCode::Delete | KeyCode::Char('d') if !ctrl => {
+                self.ensure_selection();
+                self.ask_delete(ctx);
             }
             _ => return EventResult::Ignored,
         }
@@ -572,6 +743,8 @@ impl Mode for FilesMode {
                     }
                 }
             }
+            FilesEvent::Deleted(report) => self.finish_delete(report.clone(), ctx),
+            FilesEvent::Compressed { tab_id, dir, result } => self.finish_compress(*tab_id, dir, result, ctx),
             FilesEvent::Pasted(report) => {
                 self.finish_paste(report.clone(), ctx);
             }
@@ -579,7 +752,7 @@ impl Mode for FilesMode {
         EventResult::Consumed
     }
 
-    fn on_menu_action(&mut self, action: u32, ctx: &mut ModeCtx) {
+    fn on_action(&mut self, action: u32, ctx: &mut ModeCtx) {
         match action {
             action::OPEN => {
                 if let Some(dir) = self.menu_into.take() {
@@ -598,6 +771,10 @@ impl Mode for FilesMode {
                 }
             }
             action::SCP => self.copy_scp(ctx),
+            action::DELETE => self.ask_delete(ctx),
+            action::COMPRESS => self.compress(ctx),
+            action::TOGGLE_HIDDEN => self.toggle_hidden(ctx),
+            action::DELETE_CONFIRMED => self.delete(),
             action::TERMINAL => {
                 if let Some(cwd) = self.menu_terminal.take() {
                     ctx.request(OpenTerminal { cwd });
@@ -611,15 +788,32 @@ impl Mode for FilesMode {
         let tab = &self.tabs[self.active];
         let selected = tab.selected_entries();
         let sel = match selected.as_slice() {
-            [] => tab.path.display().to_string(),
-            [one] if one.is_dir() => one.name.to_string_lossy().into_owned(),
-            [one] => format!("{} · {}", one.name.to_string_lossy(), ops::human_size(one.size)),
-            many => format!("{} selected", many.len()),
+            [] => String::new(),
+            [one] if one.is_dir() => format!(" · {}", one.name.to_string_lossy()),
+            [one] => format!(" · {} · {}", one.name.to_string_lossy(), ops::human_size(one.size)),
+            many => format!(" · {} selected", many.len()),
         };
         let clip = self.clip.as_ref().map_or(String::new(), |c| {
             format!(" · {} to {}", c.items.len(), if c.op == ClipOp::Move { "move" } else { "copy" })
         });
-        let busy = if self.pasting { " · pasting…" } else { "" };
-        format!("{} · {sel}{clip}{busy}", shared.host.label())
+        let busy = if self.pasting {
+            " · pasting…"
+        } else if self.deleting {
+            " · deleting…"
+        } else if self.compressing {
+            " · compressing…"
+        } else {
+            ""
+        };
+        format!("{}{sel}{clip}{busy}", shared.host.label())
+    }
+
+    fn hints(&self, shared: &Shared) -> Vec<KeyHint> {
+        vec![KeyHint::new(crate::keys::display(&shared.config.leader), "Shortcuts").opens_shortcuts()]
+    }
+
+    fn shortcut_items(&self) -> Vec<MenuItem> {
+        let label = if self.show_hidden { "Hide hidden files" } else { "Show hidden files" };
+        vec![MenuItem::action(label, action::TOGGLE_HIDDEN).with_hint(".")]
     }
 }

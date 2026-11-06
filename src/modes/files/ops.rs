@@ -36,6 +36,14 @@ pub fn unique_name(name: &str, is_dir: bool, taken: &HashSet<String>) -> String 
         .expect("an unused name always exists")
 }
 
+/// `base.tar.gz`, then `base (2).tar.gz`, `base (3).tar.gz`… until unused.
+pub fn archive_name(base: &str, taken: &HashSet<String>) -> String {
+    (1..)
+        .map(|i| if i == 1 { format!("{base}.tar.gz") } else { format!("{base} ({i}).tar.gz") })
+        .find(|c| !taken.contains(c))
+        .expect("an unused name always exists")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipOp {
     Copy,
@@ -205,6 +213,13 @@ mod tests {
         );
         assert_eq!(unique_name("apps.d", true, &set(&["apps.d"])), "apps.d (copy)");
         assert_eq!(unique_name(".bashrc", false, &set(&[".bashrc"])), ".bashrc (copy)");
+    }
+
+    #[test]
+    fn archive_names_never_collide() {
+        assert_eq!(archive_name("apps", &set(&[])), "apps.tar.gz");
+        assert_eq!(archive_name("apps", &set(&["apps.tar.gz"])), "apps (2).tar.gz");
+        assert_eq!(archive_name("apps", &set(&["apps.tar.gz", "apps (2).tar.gz"])), "apps (3).tar.gz");
     }
 
     #[test]

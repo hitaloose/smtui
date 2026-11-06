@@ -18,11 +18,25 @@ use crate::{
         AppLayout,
         bars::{self, ChromeTarget},
         hit::HitMap,
-        menu::MenuState,
+        dialog::{DialogHit, DialogState},
+        menu::{MenuOwner, MenuState},
         terminal_guard::Tui,
         toast::Toast,
     },
 };
+
+/// Actions of the app's own menus (the shortcuts menu).
+mod app_action {
+    pub const NEW_TAB: u32 = 1;
+    pub const CLOSE_TAB: u32 = 2;
+    pub const NEXT_TAB: u32 = 3;
+    pub const PREV_TAB: u32 = 4;
+    pub const QUIT: u32 = 5;
+    /// `MODE_BASE + i` switches to mode `i`.
+    pub const MODE_BASE: u32 = 100;
+    /// `MODE_ACTION_BASE + a` runs action `a` of the active mode (its shortcut items).
+    pub const MODE_ACTION_BASE: u32 = 1_000_000;
+}
 
 pub struct App {
     shared: Shared,
@@ -31,6 +45,7 @@ pub struct App {
     leader: KeyChord,
     leader_pending: bool,
     menu: Option<MenuState>,
+    dialog: Option<DialogState>,
     toast: Option<Toast>,
     chrome_hits: HitMap<ChromeTarget>,
     layout: AppLayout,
@@ -50,6 +65,7 @@ impl App {
             leader,
             leader_pending: false,
             menu: None,
+            dialog: None,
             toast: None,
             chrome_hits: HitMap::default(),
             layout: AppLayout::default(),
@@ -109,19 +125,16 @@ impl App {
 
         let mut status = mode.status(&self.shared);
         if self.leader_pending {
-            status = format!("[{}] t new · w close · n/p next/prev · 1-9 mode · q quit", self.shared.config.leader);
+            status = format!(
+                "{}: t new · w close · n/p next/prev · 1-9 mode · ? menu · q quit",
+                crate::keys::display(&self.shared.config.leader)
+            );
         }
         let mode_list: Vec<(String, String)> =
             self.modes.iter().map(|m| (m.icon().to_string(), m.name().to_string())).collect();
-        bars::render_bottom_bar(
-            f,
-            self.layout.bottom_bar,
-            theme,
-            &mode_list,
-            self.active_mode,
-            &status,
-            &mut self.chrome_hits,
-        );
+        let hints = self.modes[self.active_mode].hints(&self.shared);
+        let bar = bars::BottomBar { modes: &mode_list, active: self.active_mode, status: &status, hints: &hints };
+        bars::render_bottom_bar(f, self.layout.bottom_bar, theme, &bar, &mut self.chrome_hits);
 
         if let Some(toast) = &self.toast {
             let mut area = self.layout.content;
@@ -130,6 +143,9 @@ impl App {
         }
         if let Some(menu) = &mut self.menu {
             menu.render(f, theme);
+        }
+        if let Some(dialog) = &mut self.dialog {
+            dialog.render(f, theme);
         }
     }
 
@@ -146,9 +162,13 @@ impl App {
         for effect in effects {
             match effect {
                 Effect::Request(req) => requests.push(req),
+                Effect::Confirm(c) => {
+                    self.menu = None;
+                    self.dialog = Some(DialogState::new(idx, c));
+                }
                 Effect::Toast { msg, detail } => self.toast = Some(Toast::new(msg, detail)),
                 Effect::OpenMenu { x, y, items } => {
-                    self.menu = (!items.is_empty()).then(|| MenuState::new(idx, (x, y), items));
+                    self.menu = (!items.is_empty()).then(|| MenuState::new(MenuOwner::Mode(idx), (x, y), items));
                 }
             }
         }
@@ -182,6 +202,11 @@ impl App {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Paste(text) if self.dialog.is_some() => {
+                if let Some(d) = &mut self.dialog {
+                    d.type_text(&text);
+                }
+            }
             Event::Paste(text) if self.menu.is_none() => {
                 let i = self.active_mode;
                 self.with_mode(i, |m, ctx| m.handle_paste(&text, ctx));
@@ -191,6 +216,26 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if let Some(dialog) = &mut self.dialog {
+            match key.code {
+                KeyCode::Esc => self.dialog = None,
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right if !dialog.has_input() => {
+                    dialog.toggle_focus()
+                }
+                KeyCode::Enter => {
+                    let confirm = if dialog.has_input() { dialog.can_confirm() } else { dialog.confirm_focused() };
+                    if confirm {
+                        self.accept_dialog();
+                    } else if !dialog.has_input() {
+                        self.dialog = None;
+                    }
+                }
+                KeyCode::Backspace => dialog.backspace(),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => dialog.type_text(&c.to_string()),
+                _ => {}
+            }
+            return;
+        }
         if let Some(menu) = &mut self.menu {
             match key.code {
                 KeyCode::Esc => self.menu = None,
@@ -246,6 +291,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char(c @ '1'..='9') => self.switch_mode(c as usize - '1' as usize),
             KeyCode::Char('m') | KeyCode::Tab => self.switch_mode((self.active_mode + 1) % self.modes.len()),
+            KeyCode::Char('?') | KeyCode::Char(' ') => self.open_shortcuts_menu_from_keyboard(),
             _ => {}
         }
     }
@@ -259,6 +305,7 @@ impl App {
             KeyCode::Tab => self.cycle_tab(1),
             KeyCode::BackTab => self.cycle_tab(-1),
             KeyCode::F(n @ 1..=9) => self.switch_mode(n as usize - 1),
+            KeyCode::Char('?') => self.open_shortcuts_menu_from_keyboard(),
             KeyCode::Char('q') if key.modifiers.is_empty() => self.quit = true,
             _ => {}
         }
@@ -266,6 +313,22 @@ impl App {
 
     fn handle_mouse(&mut self, ev: MouseEvent) {
         let (x, y) = (ev.column, ev.row);
+        if let Some(dialog) = &mut self.dialog {
+            if ev.kind == MouseEventKind::Down(MouseButton::Left) {
+                match dialog.hit(x, y) {
+                    Some(DialogHit::Confirm) if dialog.can_confirm() => self.accept_dialog(),
+                    Some(DialogHit::Cancel) | None => self.dialog = None,
+                    _ => {}
+                }
+            } else if let MouseEventKind::Moved = ev.kind {
+                match dialog.hit(x, y) {
+                    Some(DialogHit::Confirm) => dialog.focus_confirm(true),
+                    Some(DialogHit::Cancel) => dialog.focus_confirm(false),
+                    _ => {}
+                }
+            }
+            return;
+        }
         if let Some(menu) = &mut self.menu {
             match ev.kind {
                 MouseEventKind::Moved | MouseEventKind::Drag(_) => menu.hover(x, y),
@@ -291,6 +354,11 @@ impl App {
                     Some(ChromeTarget::NewTab) => self.new_tab(),
                     Some(ChromeTarget::Mode(i)) => self.switch_mode(i),
                     Some(ChromeTarget::Quit) => self.quit = true,
+                    Some(ChromeTarget::Shortcuts) => self.open_shortcuts_menu(x, y),
+                    Some(ChromeTarget::Hint(action)) => {
+                        let i = self.active_mode;
+                        self.with_mode(i, |m, ctx| m.on_action(action, ctx));
+                    }
                     None => {}
                 }
             }
@@ -302,7 +370,79 @@ impl App {
 
     fn run_menu_action(&mut self, action: u32) {
         if let Some(menu) = self.menu.take() {
-            self.with_mode(menu.mode, |m, ctx| m.on_menu_action(action, ctx));
+            match menu.owner {
+                MenuOwner::Mode(i) => self.with_mode(i, |m, ctx| m.on_action(action, ctx)),
+                MenuOwner::App => self.run_app_action(action),
+            }
+        }
+    }
+
+    /// The leader-key commands as a clickable menu, each with its key as the hint.
+    fn open_shortcuts_menu(&mut self, x: u16, _y: u16) {
+        use crate::modes::MenuItem;
+        let mode = &self.modes[self.active_mode];
+        let closable = mode.tabs().len() > 1;
+        // Modes that capture input (Terminal) use the keys after the leader; the others
+        // also have direct shortcuts (see `global_shortcut`), which are shorter to show.
+        let leader = mode.captures_input();
+        let key = |after_leader: &str, direct: &str| if leader { after_leader.to_string() } else { direct.to_string() };
+        let mut items = vec![
+            MenuItem::action("New tab", app_action::NEW_TAB).with_hint(key("t", "Ctrl-t")),
+            MenuItem::action("Close tab", app_action::CLOSE_TAB).with_hint(key("w", "Ctrl-w")).enabled(closable),
+            MenuItem::action("Next tab", app_action::NEXT_TAB).with_hint(key("n", "Tab")),
+            MenuItem::action("Previous tab", app_action::PREV_TAB).with_hint(key("p", "Shift-Tab")),
+            MenuItem::Separator,
+        ];
+        let own = mode.shortcut_items();
+        if !own.is_empty() {
+            items.extend(own.into_iter().map(|it| match it {
+                MenuItem::Action { label, hint, enabled, danger, action } => {
+                    MenuItem::Action { label, hint, enabled, danger, action: app_action::MODE_ACTION_BASE + action }
+                }
+                sep => sep,
+            }));
+            items.push(MenuItem::Separator);
+        }
+        for (i, m) in self.modes.iter().enumerate().take(9) {
+            if i != self.active_mode {
+                items.push(
+                    MenuItem::action(format!("Switch to {}", m.name()), app_action::MODE_BASE + i as u32)
+                        .with_hint(key(&(i + 1).to_string(), &format!("F{}", i + 1))),
+                );
+            }
+        }
+        items.push(MenuItem::Separator);
+        items.push(MenuItem::action("Quit", app_action::QUIT).with_hint(key("q", "q")));
+        let top_of_bar = self.layout.bottom_bar.y;
+        self.menu = Some(MenuState::new(MenuOwner::App, (x.saturating_sub(4), top_of_bar), items).above());
+    }
+
+    /// Opens the shortcuts menu at the right of the bottom bar, where its hint is.
+    fn open_shortcuts_menu_from_keyboard(&mut self) {
+        let x = self.layout.bottom_bar.right().saturating_sub(34);
+        self.open_shortcuts_menu(x + 4, self.layout.bottom_bar.y);
+    }
+
+    fn run_app_action(&mut self, action: u32) {
+        match action {
+            app_action::NEW_TAB => self.new_tab(),
+            app_action::CLOSE_TAB => self.close_tab(self.modes[self.active_mode].active_tab()),
+            app_action::NEXT_TAB => self.cycle_tab(1),
+            app_action::PREV_TAB => self.cycle_tab(-1),
+            app_action::QUIT => self.quit = true,
+            a if a >= app_action::MODE_ACTION_BASE => {
+                let i = self.active_mode;
+                self.with_mode(i, |m, ctx| m.on_action(a - app_action::MODE_ACTION_BASE, ctx));
+            }
+            a if a >= app_action::MODE_BASE => self.switch_mode((a - app_action::MODE_BASE) as usize),
+            _ => {}
+        }
+    }
+
+    fn accept_dialog(&mut self) {
+        if let Some(d) = self.dialog.take() {
+            let action = d.confirm.action;
+            self.with_mode(d.mode, |m, ctx| m.on_action(action, ctx));
         }
     }
 

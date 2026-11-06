@@ -44,6 +44,32 @@ impl Fs for LocalFs {
         // No shell involved: paths are passed as plain arguments.
         run(Command::new("cp").arg("-Rp").arg("--").arg(from).arg(to))
     }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        Self::remove_impl(path)
+    }
+
+    fn compress(&self, dir: &Path, names: &[std::ffi::OsString], dest: &Path) -> io::Result<()> {
+        ensure_absent(dest)?;
+        // No shell; `./name` keeps names starting with `-` from being read as options.
+        let mut cmd = Command::new("tar");
+        cmd.arg("-czf").arg(dest).arg("-C").arg(dir);
+        for name in names {
+            cmd.arg(Path::new(".").join(name));
+        }
+        let result = run(&mut cmd);
+        if result.is_err() {
+            let _ = std::fs::remove_file(dest); // do not leave a partial archive behind
+        }
+        result
+    }
+}
+
+impl LocalFs {
+    fn remove_impl(path: &Path) -> io::Result<()> {
+        // symlink_metadata does not follow links, so a link to a folder is removed as a file.
+        if path.symlink_metadata()?.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }
+    }
 }
 
 fn ensure_absent(path: &Path) -> io::Result<()> {
@@ -87,5 +113,37 @@ mod tests {
 
         let names: Vec<_> = LocalFs.list(root).unwrap().into_iter().map(|e| e.name).collect();
         assert!(names.contains(&"moved".into()) && names.contains(&"dest".into()));
+
+        LocalFs.remove(&root.join("moved")).unwrap();
+        assert!(!root.join("moved").exists());
+    }
+
+    #[test]
+    fn compresses_files_and_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("apps/api")).unwrap();
+        std::fs::write(root.join("apps/api/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("-odd name.txt"), "x").unwrap();
+        let dest = root.join("out.tar.gz");
+        LocalFs.compress(root, &["apps".into(), "-odd name.txt".into()], &dest).unwrap();
+        let listing = Command::new("tar").arg("-tzf").arg(&dest).output().unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("apps/api/main.rs"), "{listing}");
+        assert!(listing.contains("-odd name.txt"), "{listing}");
+        assert!(LocalFs.compress(root, &["apps".into()], &dest).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_symlink_keeps_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/keep.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        LocalFs.remove(&root.join("link")).unwrap();
+        assert!(!root.join("link").exists());
+        assert!(root.join("real/keep.txt").exists());
     }
 }

@@ -34,4 +34,8 @@ pub trait Fs: Send + Sync {
     fn move_to(&self, from: &Path, to: &Path) -> io::Result<()>;
     /// Copies `from` (recursively for folders) to `to`; fails if `to` exists.
     fn copy_to(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Deletes `path` permanently: folders with their content; symlinks themselves, never their target.
+    fn remove(&self, path: &Path) -> io::Result<()>;
+    /// Creates the gzip-compressed tarball `dest` from the entries `names` of `dir`; fails if `dest` exists.
+    fn compress(&self, dir: &Path, names: &[std::ffi::OsString], dest: &Path) -> io::Result<()>;
 }

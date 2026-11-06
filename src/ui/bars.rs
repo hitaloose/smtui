@@ -13,7 +13,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{hit::HitMap, theme::Theme};
-use crate::modes::TabInfo;
+use crate::modes::{HintTarget, KeyHint, TabInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeTarget {
@@ -21,6 +21,10 @@ pub enum ChromeTarget {
     CloseTab(usize),
     NewTab,
     Mode(usize),
+    /// A clickable hint; the value is the mode action to run.
+    Hint(u32),
+    /// Opens the menu of leader-key shortcuts.
+    Shortcuts,
     Quit,
 }
 
@@ -134,15 +138,17 @@ pub fn render_tab_bar(
     hits.push(Rect::new(plus.x + 1, plus.y, plus_w - 1, plus.height), ChromeTarget::NewTab);
 }
 
-pub fn render_bottom_bar(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    modes: &[(String, String)],
-    active: usize,
-    status: &str,
-    hits: &mut HitMap<ChromeTarget>,
-) {
+/// What the bottom bar shows.
+pub struct BottomBar<'a> {
+    /// (icon, name) of every registered mode.
+    pub modes: &'a [(String, String)],
+    pub active: usize,
+    pub status: &'a str,
+    pub hints: &'a [KeyHint],
+}
+
+pub fn render_bottom_bar(f: &mut Frame, area: Rect, theme: &Theme, bar: &BottomBar, hits: &mut HitMap<ChromeTarget>) {
+    let BottomBar { modes, active, status, hints } = *bar;
     fill(f, area, Style::new().bg(theme.bar_bg));
     let y = mid(area);
 
@@ -171,23 +177,54 @@ pub fn render_bottom_bar(
     }
     let x = group.right();
 
-    // Quit button at the far right.
-    let quit_label = "  × Quit  ";
-    let quit_w = quit_label.width() as u16;
-    let mut right = area.right();
-    if x + quit_w + 2 < area.right() {
-        let rect = Rect::new(area.right() - quit_w - 1, area.y, quit_w, area.height);
-        let style = Style::new().bg(theme.raised_bg).fg(theme.fg_muted);
-        fill(f, rect, style);
-        text_at(f, rect.x, y, vec![Span::styled(quit_label, style)]);
-        hits.push(rect, ChromeTarget::Quit);
-        right = rect.x;
+    // Right side, separated by `│`: status, the mode's hints, then the Quit keycap.
+    let keycap = |k: &str| Span::styled(format!(" {k} "), Style::new().bg(theme.fg_muted).fg(theme.bar_bg).add_modifier(Modifier::BOLD));
+    let label = |l: &str| Span::styled(format!(" {l}"), Style::new().fg(theme.fg).bg(theme.bar_bg));
+    let mut groups: Vec<(Vec<Span<'static>>, Option<ChromeTarget>)> = Vec::new();
+    for h in hints {
+        let mut spans = vec![keycap(&h.key), label(&h.label)];
+        match h.state {
+            Some(true) => spans.push(Span::styled(" ● on", Style::new().fg(theme.accent).bg(theme.bar_bg).add_modifier(Modifier::BOLD))),
+            Some(false) => spans.push(Span::styled(" ○ off", Style::new().fg(theme.fg_muted).bg(theme.bar_bg))),
+            None => {}
+        }
+        let target = match h.target {
+            HintTarget::None => None,
+            HintTarget::Action(a) => Some(ChromeTarget::Hint(a)),
+            HintTarget::Shortcuts => Some(ChromeTarget::Shortcuts),
+        };
+        groups.push((spans, target));
+    }
+    groups.push((vec![keycap("Ctrl-q"), label("Quit")], Some(ChromeTarget::Quit)));
+
+    const SEP: u16 = 5; // "  │  "
+    let width = |spans: &[Span]| spans.iter().map(|s| s.width() as u16).sum::<u16>();
+    let mut right = area.right().saturating_sub(2);
+    let min_x = x + 2;
+    for (i, (spans, target)) in groups.into_iter().enumerate().rev() {
+        let w = width(&spans);
+        let sep = if i + 1 < hints.len() + 1 { SEP } else { 0 };
+        if right < min_x + w + sep {
+            break;
+        }
+        if sep > 0 {
+            right -= sep;
+            text_at(f, right + 2, y, vec![Span::styled("│", Style::new().fg(theme.border).bg(theme.bar_bg))]);
+        }
+        right -= w;
+        text_at(f, right, y, spans);
+        if let Some(t) = target {
+            hits.push(Rect::new(right.saturating_sub(1), area.y, w + 2, area.height), t);
+        }
     }
 
-    let room = right.saturating_sub(x + 4) as usize;
-    if room > 0 {
+    // Status takes what is left, truncated from the end.
+    let room = right.saturating_sub(min_x + SEP) as usize;
+    if room > 3 {
         let text = truncate(status, room);
         let w = text.width() as u16;
-        text_at(f, right.saturating_sub(w + 2), y, vec![Span::styled(text, Style::new().fg(theme.fg_muted).bg(theme.bar_bg))]);
+        right -= SEP;
+        text_at(f, right + 2, y, vec![Span::styled("│", Style::new().fg(theme.border).bg(theme.bar_bg))]);
+        text_at(f, right - w, y, vec![Span::styled(text, Style::new().fg(theme.fg_muted).bg(theme.bar_bg))]);
     }
 }

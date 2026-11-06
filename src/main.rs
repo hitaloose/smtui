@@ -51,7 +51,8 @@ async fn main() -> Result<()> {
     let (tx, rx) = event::channel();
     let shared = Shared {
         theme: Theme::new(&config.accent, config.truecolor),
-        host: HostInfo::detect(),
+        // The demo shows a made-up server, matching its sample files.
+        host: if cli.demo { HostInfo::demo() } else { HostInfo::detect() },
         config,
         tx: tx.clone(),
     };

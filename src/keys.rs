@@ -54,6 +54,24 @@ impl KeyChord {
     }
 }
 
+/// Human-readable form of a chord spec: `ctrl-]` → `Ctrl-]`.
+pub fn display(spec: &str) -> String {
+    let spec = spec.trim();
+    let mut parts: Vec<String> = Vec::new();
+    let mut rest = spec;
+    while let Some((m, tail)) = rest.split_once('-').filter(|(_, t)| !t.is_empty()) {
+        parts.push(match m.to_ascii_lowercase().as_str() {
+            "ctrl" | "c" => "Ctrl".into(),
+            "alt" | "a" | "meta" | "m" => "Alt".into(),
+            "shift" | "s" => "Shift".into(),
+            other => other.to_string(),
+        });
+        rest = tail;
+    }
+    parts.push(if rest.len() > 1 { format!("{}{}", rest[..1].to_uppercase(), &rest[1..]) } else { rest.to_string() });
+    parts.join("-")
+}
+
 /// Legacy terminals send Ctrl+\ ] ^ _ as 0x1c–0x1f, which crossterm reports as Ctrl+4–7.
 fn control_alias(c: char) -> Option<char> {
     match c {
@@ -79,6 +97,13 @@ mod tests {
         assert!(k.matches(&key(KeyCode::Char(']'), KeyModifiers::CONTROL)));
         assert!(k.matches(&key(KeyCode::Char('5'), KeyModifiers::CONTROL)));
         assert!(!k.matches(&key(KeyCode::Char(']'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn displays_chords() {
+        assert_eq!(display("ctrl-]"), "Ctrl-]");
+        assert_eq!(display("alt-space"), "Alt-Space");
+        assert_eq!(display("ctrl--"), "Ctrl--");
     }
 
     #[test]

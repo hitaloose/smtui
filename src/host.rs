@@ -32,9 +32,16 @@ impl HostInfo {
         Self { user, hostname, ssh_server, in_tmux }
     }
 
-    /// `user@hostname`, used in the status bar.
+    /// The fictional `deploy@edge1` server of `--demo`.
+    pub fn demo() -> Self {
+        let real = Self::detect();
+        Self { user: "deploy".into(), hostname: "edge1".into(), ssh_server: None, in_tmux: real.in_tmux }
+    }
+
+    /// `user@host` with the short hostname (up to the first dot), used in the status bar.
     pub fn label(&self) -> String {
-        format!("{}@{}", self.user, self.hostname)
+        let short = self.hostname.split('.').next().filter(|s| !s.is_empty()).unwrap_or(&self.hostname);
+        format!("{}@{short}", self.user)
     }
 
     /// Config overrides first, then the address from `$SSH_CONNECTION`, then the hostname.

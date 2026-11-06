@@ -1,5 +1,7 @@
 # smtui — server manager TUI
 
+![smtui: terminal tabs and a file browser with copy, paste and delete](docs/demo.gif)
+
 A terminal UI that runs **on the server**, with mouse and keyboard support. It has two modes:
 
 - **Terminal**: real local shells (`$SHELL -l`) in tabs, using a PTY plus a VT100 emulator.
@@ -70,6 +72,7 @@ XON flow-control key in most shells and rarely used).
 | `Ctrl+]` then `w` | Close tab |
 | `Ctrl+]` then `n` / `p` | Next / previous tab |
 | `Ctrl+]` then `1`…`9` | Switch mode |
+| `Ctrl+]` then `?` (or `?` in Files) | Shortcuts menu |
 | `Ctrl+Q` (any mode), `Ctrl+]` then `q`, or the **Quit** button | Quit |
 | `Ctrl+]` `Ctrl+]` | Send `Ctrl+]` to the shell |
 | `Ctrl+T`, `Ctrl+W`, `Tab` / `Shift+Tab`, `F1`/`F2`, `q` | Same, in Files mode |
@@ -87,12 +90,14 @@ XON flow-control key in most shells and rarely used).
 | `Space` | Toggle the cursor item in the selection |
 | `Backspace`, `←` | Up one level |
 | `Ctrl+A` / `Esc` | Select all / clear selection |
-| Right click, `Menu`, `Shift+F10` | Context menu |
+| Right click, `o`, `Menu`, `Shift+F10` | Context menu |
 | `c` / `m` | Copy / Move (mark the items, then Paste in the destination) |
 | `v` | Paste here |
 | `s` | Copy scp command |
+| `z` | Compress the selection to `name.tar.gz` (never overwrites: `name (2).tar.gz`…) |
 | `t` | Open a terminal tab in the selected folder (or the current one) |
-| `.` / `r` | Toggle hidden files / refresh |
+| `.` / `r` | Toggle hidden files (also in the Shortcuts menu) / refresh |
+| `Delete`, `d` | Delete the selection (asks you to type `DELETE` to confirm) |
 
 Copy and Move work in two steps: mark the items, open the destination (in any tab) and Paste.
 Name clashes become `name (copy)`, `name (copy 2)`…; moving into the same folder and pasting a
@@ -126,6 +131,9 @@ cargo test
 cargo clippy --all-targets
 cargo run -- --demo
 ```
+
+The GIF above is recorded with [VHS](https://github.com/charmbracelet/vhs) from `docs/demo.tape`:
+`cargo build --release && vhs docs/demo.tape`.
 
 New modes implement the `Mode` trait in `src/modes/mod.rs` and are registered in `src/main.rs`;
 the tab bar and the bottom bar are generated from the registered modes.

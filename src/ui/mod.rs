@@ -1,4 +1,5 @@
 pub mod bars;
+pub mod dialog;
 pub mod hit;
 pub mod menu;
 pub mod terminal_guard;

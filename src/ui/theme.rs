@@ -36,6 +36,9 @@ pub struct Theme {
     pub accent: Color,
     /// Accent blended into the background: selection and active controls.
     pub accent_tint: Color,
+    /// Destructive actions (delete).
+    pub danger: Color,
+    pub danger_tint: Color,
 }
 
 const BG: Rgb = Rgb(0x14, 0x16, 0x1a);
@@ -47,6 +50,7 @@ const FG: Rgb = Rgb(0xe6, 0xe8, 0xeb);
 const FG_MUTED: Rgb = Rgb(0x9a, 0xa3, 0xad);
 const FG_DISABLED: Rgb = Rgb(0x5b, 0x63, 0x6e);
 const DEFAULT_ACCENT: Rgb = Rgb(0x5e, 0xea, 0xd4);
+const DANGER: Rgb = Rgb(0xf8, 0x71, 0x71);
 
 impl Theme {
     pub fn new(accent_hex: &str, truecolor: Option<bool>) -> Self {
@@ -65,6 +69,8 @@ impl Theme {
             fg_dimmed: c(FG.mix(BG, 0.5)),
             accent: c(accent),
             accent_tint: c(BG.mix(accent, 0.18)),
+            danger: c(DANGER),
+            danger_tint: c(BG.mix(DANGER, 0.22)),
         }
     }
 }
