@@ -128,6 +128,114 @@ pub fn shell_quote(s: &str) -> Cow<'_, str> {
     if safe { Cow::Borrowed(s) } else { Cow::Owned(format!("'{}'", s.replace('\'', "'\\''"))) }
 }
 
+fn remote_arg(target: &ScpTarget, path: &str) -> String {
+    let host = if target.host.contains(':') && !target.host.starts_with('[') {
+        format!("[{}]", target.host)
+    } else {
+        target.host.clone()
+    };
+    shell_quote(&format!("{}@{}:{}", target.user, host, path)).into_owned()
+}
+
+/// Placeholder used by "Copy upload command" for the user to replace.
+pub const LOCAL_PATH_PLACEHOLDER: &str = "<LOCAL_PATH>";
+
+/// Quotes a path on the user's machine, keeping a leading `~/` unquoted so it still expands.
+fn local_arg(path: &str) -> String {
+    if path == LOCAL_PATH_PLACEHOLDER {
+        return path.to_string();
+    }
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("~/{}", shell_quote(rest)),
+        None => shell_quote(path).into_owned(),
+    }
+}
+
+/// Command to run on the user's machine that uploads `locals` into the folder `dest`.
+/// `-r` is always used: from the server we cannot tell whether a local path is a folder.
+pub fn scp_upload_command(target: &ScpTarget, locals: &[String], dest: &Path) -> String {
+    let mut parts = vec!["scp".to_string(), "-r".into()];
+    if target.port != 22 {
+        parts.push(format!("-P {}", target.port));
+    }
+    parts.extend(locals.iter().map(|l| local_arg(l)));
+    let dest = dest.to_string_lossy();
+    let dest = if dest.ends_with('/') { dest.into_owned() } else { format!("{dest}/") };
+    parts.push(remote_arg(target, &dest));
+    parts.join(" ")
+}
+
+/// Paths pasted by a terminal when files are dropped on it, or `None` if the text is not
+/// only paths. Handles `My\ File` escapes, single/double quotes, one path per line and
+/// `file://` URIs.
+pub fn parse_dropped_paths(text: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut chars = text.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                    in_token = true;
+                }
+            }
+            '\'' | '"' => {
+                in_token = true;
+                for q in chars.by_ref() {
+                    if q == c {
+                        break;
+                    }
+                    cur.push(q);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        tokens.push(cur);
+    }
+    let paths: Vec<String> = tokens
+        .into_iter()
+        .map(|t| match t.strip_prefix("file://") {
+            // file:///Users/me/a%20b.txt (an optional host before the path is dropped)
+            Some(rest) => percent_decode(&rest[rest.find('/').unwrap_or(0)..]),
+            None => t,
+        })
+        .collect();
+    let looks_local = |p: &String| p.starts_with('/') || p.starts_with("~/");
+    (!paths.is_empty() && paths.iter().all(looks_local)).then_some(paths)
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Command to download `items` (path, is_dir) to the current local directory.
 pub fn scp_command(target: &ScpTarget, items: &[(PathBuf, bool)]) -> String {
     let host = if target.host.contains(':') && !target.host.starts_with('[') {
@@ -284,6 +392,45 @@ mod tests {
         assert_eq!(
             scp_command(&t, &[("/tmp/my file".into(), false)]),
             "scp -P 2222 'deploy@[fe80::1]:/tmp/my file' ."
+        );
+    }
+
+    #[test]
+    fn parses_dropped_paths() {
+        // Terminal.app / iTerm2: backslash-escaped, space separated
+        assert_eq!(
+            parse_dropped_paths("/Users/me/My\\ File.txt /Users/me/b.txt "),
+            Some(vec!["/Users/me/My File.txt".into(), "/Users/me/b.txt".into()])
+        );
+        // Quoted, and one per line
+        assert_eq!(
+            parse_dropped_paths("'/tmp/a b'\n\"/tmp/it's\""),
+            Some(vec!["/tmp/a b".into(), "/tmp/it's".into()])
+        );
+        // file:// URIs with percent encoding
+        assert_eq!(parse_dropped_paths("file:///home/me/a%20b.txt"), Some(vec!["/home/me/a b.txt".into()]));
+        assert_eq!(parse_dropped_paths("~/notes.md"), Some(vec!["~/notes.md".into()]));
+        // Ordinary pasted text is not a drop
+        assert_eq!(parse_dropped_paths("hello world"), None);
+        assert_eq!(parse_dropped_paths("/tmp/a and more"), None);
+        assert_eq!(parse_dropped_paths("   "), None);
+    }
+
+    #[test]
+    fn builds_upload_command() {
+        let t = ScpTarget { user: "deploy".into(), host: "edge1".into(), port: 22 };
+        assert_eq!(
+            scp_upload_command(&t, &["/Users/me/My File.txt".into(), "~/a b".into()], Path::new("/home/deploy/apps")),
+            "scp -r '/Users/me/My File.txt' ~/'a b' deploy@edge1:/home/deploy/apps/"
+        );
+        let t = ScpTarget { port: 2222, ..t };
+        assert_eq!(
+            scp_upload_command(&t, &[LOCAL_PATH_PLACEHOLDER.into()], Path::new("/srv/my app")),
+            "scp -r -P 2222 <LOCAL_PATH> 'deploy@edge1:/srv/my app/'"
+        );
+        assert_eq!(
+            scp_upload_command(&t, &[LOCAL_PATH_PLACEHOLDER.into()], Path::new("/")),
+            "scp -r -P 2222 <LOCAL_PATH> deploy@edge1:/"
         );
     }
 

@@ -78,5 +78,13 @@ Sleep 800ms
 Enter
 Sleep 2.2s
 
+# Upload command for a folder: run it on your computer (dropping files on the window works too)
+Backspace
+Sleep 800ms
+Space
+Sleep 400ms
+Type "u"
+Sleep 3.5s
+
 Ctrl+q
 Sleep 500ms

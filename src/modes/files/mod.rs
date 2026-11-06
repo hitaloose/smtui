@@ -39,6 +39,7 @@ mod action {
     pub const DELETE_CONFIRMED: u32 = 9;
     pub const COMPRESS: u32 = 10;
     pub const TOGGLE_HIDDEN: u32 = 11;
+    pub const UPLOAD: u32 = 12;
 }
 
 enum FilesEvent {
@@ -82,8 +83,8 @@ pub struct FilesMode {
     last_click: Option<(Instant, usize)>,
     /// Folder that "Paste into folder" targets while the menu is open.
     menu_into: Option<PathBuf>,
-    /// Folder that "Open in terminal" targets while the menu is open.
-    menu_terminal: Option<PathBuf>,
+    /// Folder that "Open in terminal" and "Copy upload command" target while the menu is open.
+    menu_folder: Option<PathBuf>,
     /// Entries waiting for the delete confirmation: (folder, [(name, is_dir)]).
     pending_delete: Option<(PathBuf, Vec<(OsString, bool)>)>,
     deleting: bool,
@@ -106,7 +107,7 @@ impl FilesMode {
             list_body: Rect::default(),
             last_click: None,
             menu_into: None,
-            menu_terminal: None,
+            menu_folder: None,
             pending_delete: None,
             deleting: false,
             compressing: false,
@@ -445,6 +446,39 @@ impl FilesMode {
         self.reload_where(|t| t.path == dir);
     }
 
+    // ---- Upload (scp from the user's machine) ----
+
+    /// The single selected folder, or the open one.
+    fn upload_destination(&self) -> PathBuf {
+        let tab = &self.tabs[self.active];
+        match tab.selected_entries().as_slice() {
+            [one] if one.is_dir() => tab.path.join(&one.name),
+            _ => tab.path.clone(),
+        }
+    }
+
+    fn copy_upload(&mut self, locals: &[String], dest: PathBuf, dropped: bool, ctx: &mut ModeCtx) {
+        let target = ctx.shared.host.scp_target(&ctx.shared.config.scp);
+        let cmd = ops::scp_upload_command(&target, locals, &dest);
+        let outcome = clipboard::copy(&cmd, ctx.shared.host.in_tmux);
+        let what = if dropped {
+            let n = locals.len();
+            format!("Upload command for {n} {} copied", if n == 1 { "item" } else { "items" })
+        } else {
+            "Upload command copied".to_string()
+        };
+        let msg = match outcome {
+            clipboard::CopyOutcome::Copied | clipboard::CopyOutcome::Sent if dropped => {
+                format!("{what}. Run it in a terminal on your computer.")
+            }
+            clipboard::CopyOutcome::Copied | clipboard::CopyOutcome::Sent => {
+                format!("{what}. Replace {} and run it on your computer.", ops::LOCAL_PATH_PLACEHOLDER)
+            }
+            clipboard::CopyOutcome::Failed => "Could not access the clipboard. Copy it manually:".to_string(),
+        };
+        ctx.toast(msg, cmd);
+    }
+
     fn toggle_hidden(&mut self, ctx: &mut ModeCtx) {
         self.show_hidden = !self.show_hidden;
         self.reload_where(|_| true);
@@ -486,6 +520,10 @@ impl FilesMode {
             items.push(MenuItem::Separator);
             items.push(MenuItem::action("Compress to .tar.gz", action::COMPRESS).with_hint("z").enabled(!self.compressing));
             items.push(MenuItem::action("Copy scp command", action::SCP));
+            items.push(MenuItem::action(
+                if single_dir.is_some() { "Copy upload command" } else { "Copy upload command here" },
+                action::UPLOAD,
+            ).with_hint("u"));
             items.push(match &single_dir {
                 Some(_) => MenuItem::action("Open in terminal", action::TERMINAL),
                 None => MenuItem::action("Open terminal here", action::TERMINAL),
@@ -497,9 +535,10 @@ impl FilesMode {
         } else {
             items.push(MenuItem::action("Paste here", action::PASTE_HERE).with_hint(paste_hint).enabled(can_paste));
             items.push(MenuItem::Separator);
+            items.push(MenuItem::action("Copy upload command here", action::UPLOAD).with_hint("u"));
             items.push(MenuItem::action("Open terminal here", action::TERMINAL));
         }
-        self.menu_terminal = Some(match (&single_dir, on_item) {
+        self.menu_folder = Some(match (&single_dir, on_item) {
             (Some(dir), true) => dir.clone(),
             _ => self.tabs[self.active].path.clone(),
         });
@@ -681,6 +720,10 @@ impl Mode for FilesMode {
                 ctx.request(OpenTerminal { cwd });
             }
             KeyCode::Char('.') => self.toggle_hidden(ctx),
+            KeyCode::Char('u') if !ctrl => {
+                let dest = self.upload_destination();
+                self.copy_upload(&[ops::LOCAL_PATH_PLACEHOLDER.to_string()], dest, false, ctx);
+            }
             KeyCode::Char('z') if !ctrl => {
                 self.ensure_selection();
                 self.compress(ctx);
@@ -692,6 +735,21 @@ impl Mode for FilesMode {
             _ => return EventResult::Ignored,
         }
         EventResult::Consumed
+    }
+
+    /// Files dropped on the terminal arrive as pasted local paths: turn them into an upload command.
+    fn handle_paste(&mut self, text: &str, ctx: &mut ModeCtx) -> EventResult {
+        match ops::parse_dropped_paths(text) {
+            Some(paths) => {
+                let dest = self.upload_destination();
+                self.copy_upload(&paths, dest, true, ctx);
+                EventResult::Consumed
+            }
+            None => {
+                ctx.toast("Pasted text ignored", "Drop files from your computer here to get an upload command.");
+                EventResult::Consumed
+            }
+        }
     }
 
     fn handle_mouse(&mut self, ev: MouseEvent, ctx: &mut ModeCtx) -> EventResult {
@@ -774,9 +832,13 @@ impl Mode for FilesMode {
             action::DELETE => self.ask_delete(ctx),
             action::COMPRESS => self.compress(ctx),
             action::TOGGLE_HIDDEN => self.toggle_hidden(ctx),
+            action::UPLOAD => {
+                let dest = self.menu_folder.clone().unwrap_or_else(|| self.upload_destination());
+                self.copy_upload(&[ops::LOCAL_PATH_PLACEHOLDER.to_string()], dest, false, ctx);
+            }
             action::DELETE_CONFIRMED => self.delete(),
             action::TERMINAL => {
-                if let Some(cwd) = self.menu_terminal.take() {
+                if let Some(cwd) = self.menu_folder.clone() {
                     ctx.request(OpenTerminal { cwd });
                 }
             }

@@ -21,11 +21,16 @@ smtui            # or: smtui /var/www
 Download a static Linux binary from the [releases](https://github.com/hitaloose/smtui/releases) page, on the server:
 
 ```sh
+mkdir -p ~/.local/bin
 arch=$(uname -m)   # x86_64 or aarch64
-version=v0.1.0
+version=$(curl -fsSL https://api.github.com/repos/hitaloose/smtui/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
 curl -fsSL "https://github.com/hitaloose/smtui/releases/download/${version}/smtui-${version}-${arch}-unknown-linux-musl.tar.gz" \
   | tar -xz --strip-components=1 -C ~/.local/bin "smtui-${version}-${arch}-unknown-linux-musl/smtui"
+smtui --version
 ```
+
+This installs the latest release; run it again to update. For a specific version, set
+`version=v0.2.0` instead of querying the API.
 
 Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed.
 
@@ -94,10 +99,19 @@ XON flow-control key in most shells and rarely used).
 | `c` / `m` | Copy / Move (mark the items, then Paste in the destination) |
 | `v` | Paste here |
 | `s` | Copy scp command |
+| Drop files on the window | Copy an `scp` command that uploads them into the open folder (or the selected one) |
+| `u` | Copy an upload command with a `<LOCAL_PATH>` placeholder |
 | `z` | Compress the selection to `name.tar.gz` (never overwrites: `name (2).tar.gz`…) |
 | `t` | Open a terminal tab in the selected folder (or the current one) |
 | `.` / `r` | Toggle hidden files (also in the Shortcuts menu) / refresh |
 | `Delete`, `d` | Delete the selection (asks you to type `DELETE` to confirm) |
+
+**Uploading from your computer.** smtui runs on the server, so it cannot read your local files,
+but it can write the command for you: drag files from Finder (or your file manager) onto the
+terminal window while in Files mode. Terminals paste the dropped paths as text; smtui turns them
+into `scp -r <your files> user@host:<open folder>/`, copies it to your clipboard, and you run it in
+a local terminal. "Copy upload command" in the context menu (or `u`) does the same with a
+`<LOCAL_PATH>` placeholder.
 
 Copy and Move work in two steps: mark the items, open the destination (in any tab) and Paste.
 Name clashes become `name (copy)`, `name (copy 2)`…; moving into the same folder and pasting a
