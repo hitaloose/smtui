@@ -182,11 +182,9 @@ impl App {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
-            Event::Paste(text) => {
-                if self.menu.is_none() {
-                    let i = self.active_mode;
-                    self.with_mode(i, |m, ctx| m.handle_paste(&text, ctx));
-                }
+            Event::Paste(text) if self.menu.is_none() => {
+                let i = self.active_mode;
+                self.with_mode(i, |m, ctx| m.handle_paste(&text, ctx));
             }
             _ => {}
         }

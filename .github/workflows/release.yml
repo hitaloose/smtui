@@ -14,6 +14,8 @@ on:
 permissions:
   contents: write
 
+# The Rust version is pinned to match local development, so new lints in a later
+# release cannot break a release build. Bump it deliberately.
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -40,7 +42,7 @@ jobs:
           - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
