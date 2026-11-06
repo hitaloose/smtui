@@ -40,6 +40,7 @@ mod action {
     pub const COMPRESS: u32 = 10;
     pub const TOGGLE_HIDDEN: u32 = 11;
     pub const UPLOAD: u32 = 12;
+    pub const REFRESH: u32 = 13;
 }
 
 enum FilesEvent {
@@ -560,6 +561,7 @@ impl FilesMode {
         let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
         match (ev.kind, target) {
             (MouseEventKind::Down(MouseButton::Left), Some(FilesTarget::Up)) => self.go_up(),
+            (MouseEventKind::Down(MouseButton::Left), Some(FilesTarget::Refresh)) => self.load(self.active),
             (MouseEventKind::Down(MouseButton::Left), Some(FilesTarget::Crumb(p))) => {
                 if p != self.tabs[self.active].path {
                     self.navigate(p);
@@ -832,6 +834,7 @@ impl Mode for FilesMode {
             action::DELETE => self.ask_delete(ctx),
             action::COMPRESS => self.compress(ctx),
             action::TOGGLE_HIDDEN => self.toggle_hidden(ctx),
+            action::REFRESH => self.load(self.active),
             action::UPLOAD => {
                 let dest = self.menu_folder.clone().unwrap_or_else(|| self.upload_destination());
                 self.copy_upload(&[ops::LOCAL_PATH_PLACEHOLDER.to_string()], dest, false, ctx);
@@ -876,6 +879,9 @@ impl Mode for FilesMode {
 
     fn shortcut_items(&self) -> Vec<MenuItem> {
         let label = if self.show_hidden { "Hide hidden files" } else { "Show hidden files" };
-        vec![MenuItem::action(label, action::TOGGLE_HIDDEN).with_hint(".")]
+        vec![
+            MenuItem::action("Refresh", action::REFRESH).with_hint("r"),
+            MenuItem::action(label, action::TOGGLE_HIDDEN).with_hint("."),
+        ]
     }
 }

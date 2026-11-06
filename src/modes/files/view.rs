@@ -18,6 +18,7 @@ use crate::ui::{bars, hit::HitMap, theme::Theme};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesTarget {
     Up,
+    Refresh,
     Crumb(PathBuf),
     Row(usize),
 }
@@ -79,7 +80,14 @@ pub fn render_toolbar(f: &mut Frame, area: Rect, theme: &Theme, tab: &FilesTab, 
     let count = format!("{} {}", tab.entries.len(), if tab.entries.len() == 1 { "item" } else { "items" });
     let count_w = count.width() as u16;
     let right_limit = area.right().saturating_sub(count_w + 2);
-    let mut x = up.right() + 1;
+    // Refresh button, right of "up".
+    let refresh = Rect::new(up.right() + 1, area.y, 5, ctl_h);
+    let refresh_style = Style::new().fg(if tab.loading { theme.accent } else { theme.fg }).bg(theme.raised_bg);
+    bars::fill(f, refresh, refresh_style);
+    f.render_widget(Paragraph::new(Span::styled("  ↻  ", refresh_style)), Rect::new(refresh.x, y, 5, 1));
+    hits.push(refresh, FilesTarget::Refresh);
+
+    let mut x = refresh.right() + 1;
     let parts = crumbs(&tab.path);
     let last = parts.len() - 1;
     // When the path is too long, keep the tail visible.

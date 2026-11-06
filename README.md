@@ -103,7 +103,8 @@ XON flow-control key in most shells and rarely used).
 | `u` | Copy an upload command with a `<LOCAL_PATH>` placeholder |
 | `z` | Compress the selection to `name.tar.gz` (never overwrites: `name (2).tar.gz`…) |
 | `t` | Open a terminal tab in the selected folder (or the current one) |
-| `.` / `r` | Toggle hidden files (also in the Shortcuts menu) / refresh |
+| `.` | Toggle hidden files (also in the Shortcuts menu) |
+| `r`, the **↻** button | Refresh the folder (e.g. after an upload) |
 | `Delete`, `d` | Delete the selection (asks you to type `DELETE` to confirm) |
 
 **Uploading from your computer.** smtui runs on the server, so it cannot read your local files,
