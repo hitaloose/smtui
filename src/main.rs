@@ -5,6 +5,8 @@ mod event;
 mod host;
 mod keys;
 mod modes;
+mod run;
+mod state;
 mod ui;
 
 use std::path::PathBuf;
@@ -55,6 +57,8 @@ async fn main() -> Result<()> {
         host: if cli.demo { HostInfo::demo() } else { HostInfo::detect() },
         config,
         tx: tx.clone(),
+        // The demo must not change the user's real preferences.
+        state: if cli.demo { state::StateStore::in_memory() } else { state::StateStore::default_location() },
     };
 
     let (fs, files_dir): (std::sync::Arc<dyn Fs>, PathBuf) = if cli.demo {
@@ -75,9 +79,7 @@ async fn main() -> Result<()> {
 
 /// Logs go to a file because stdout belongs to the TUI. Level via `SMTUI_LOG` (e.g. `debug`).
 fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let dir = dirs::state_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))?
-        .join("smtui");
+    let dir = run::state_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let appender = tracing_appender::rolling::never(&dir, "smtui.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);

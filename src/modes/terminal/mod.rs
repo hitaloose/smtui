@@ -16,8 +16,16 @@ use ratatui::{
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use self::session::{TermEvent, TerminalSession};
-use super::{EventResult, KeyHint, Mode, ModeCtx, Shared, TabInfo, requests::OpenTerminal};
+use super::{
+    EventResult, KeyHint, MenuItem, Mode, ModeCtx, Shared, TabInfo,
+    requests::{OpenFiles, OpenTerminal},
+};
 use crate::event::{AppEvent, EventSender};
+
+mod action {
+    pub const OPEN_FILES: u32 = 1;
+    pub const COPY_PATH: u32 = 2;
+}
 
 struct TermTab {
     number: u64,
@@ -31,6 +39,8 @@ struct TermTab {
     scroll: usize,
     /// The shell starts on the first render, once the real size is known.
     needs_start: bool,
+    /// Command typed into the shell when it first starts ("Run…" from Files).
+    typed: Option<String>,
 }
 
 pub struct TerminalMode {
@@ -52,13 +62,13 @@ impl TerminalMode {
 
     fn open_tab(&mut self) {
         let cwd = self.cwd.clone();
-        self.open_tab_at(cwd, None);
+        self.open_tab_at(cwd, None, None);
     }
 
-    fn open_tab_at(&mut self, cwd: PathBuf, label: Option<String>) {
+    fn open_tab_at(&mut self, cwd: PathBuf, label: Option<String>, typed: Option<String>) {
         let number = self.next_number;
         self.next_number += 1;
-        self.tabs.push(TermTab { number, cwd, label, session: None, notice: None, scroll: 0, needs_start: true });
+        self.tabs.push(TermTab { number, cwd, label, session: None, notice: None, scroll: 0, needs_start: true, typed });
         self.active = self.tabs.len() - 1;
     }
 
@@ -69,7 +79,7 @@ impl TerminalMode {
         let tab = &mut self.tabs[idx];
         tab.scroll = 0;
         tab.needs_start = false;
-        match TerminalSession::spawn(session_id, &tab.cwd, rows, cols, self.tx.clone()) {
+        match TerminalSession::spawn(session_id, &tab.cwd, rows, cols, tab.typed.take(), self.tx.clone()) {
             Ok(s) => {
                 tab.session = Some(s);
                 tab.notice = None;
@@ -82,8 +92,21 @@ impl TerminalMode {
         }
     }
 
+    /// The active shell's current folder, falling back to the folder the tab started in.
+    fn current_dir(&self) -> PathBuf {
+        let tab = &self.tabs[self.active];
+        tab.session.as_ref().and_then(TerminalSession::cwd).unwrap_or_else(|| tab.cwd.clone())
+    }
+
     fn tab_by_session(&mut self, id: u64) -> Option<&mut TermTab> {
         self.tabs.iter_mut().find(|t| t.session.as_ref().is_some_and(|s| s.id() == id))
+    }
+}
+
+impl TerminalMode {
+    /// `Ctrl-] f`: menu hints show the leader before the key.
+    fn leader_hint(&self, ctx: &ModeCtx, key: &str) -> String {
+        format!("{} {key}", crate::keys::display(&ctx.shared.config.leader))
     }
 }
 
@@ -216,7 +239,7 @@ impl Mode for TerminalMode {
         EventResult::Consumed
     }
 
-    fn handle_mouse(&mut self, ev: MouseEvent, _ctx: &mut ModeCtx) -> EventResult {
+    fn handle_mouse(&mut self, ev: MouseEvent, ctx: &mut ModeCtx) -> EventResult {
         let area = self.area;
         if !area.contains((ev.column, ev.row).into()) {
             return EventResult::Ignored;
@@ -246,9 +269,35 @@ impl Mode for TerminalMode {
                 let bytes = input::encode_key(&key, app_cursor);
                 session.write(&bytes.repeat(3));
             }
+            // Right click on a plain shell (the program did not ask for the mouse).
+            MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
+                ctx.open_menu(ev.column, ev.row, vec![
+                    MenuItem::action("Open Files here", action::OPEN_FILES).with_hint(self.leader_hint(ctx, "f")),
+                    MenuItem::action("Copy current folder path", action::COPY_PATH),
+                ]);
+            }
             _ => return EventResult::Ignored,
         }
         EventResult::Consumed
+    }
+
+    fn on_action(&mut self, action: u32, ctx: &mut ModeCtx) {
+        match action {
+            action::OPEN_FILES => ctx.request(OpenFiles { path: self.current_dir() }),
+            action::COPY_PATH => {
+                let path = self.current_dir().to_string_lossy().into_owned();
+                let msg = match crate::clipboard::copy(&path, ctx.shared.host.in_tmux) {
+                    crate::clipboard::CopyOutcome::Failed => "Could not access the clipboard. Copy it manually:",
+                    _ => "Folder path copied",
+                };
+                ctx.toast(msg, path);
+            }
+            _ => {}
+        }
+    }
+
+    fn shortcut_items(&self) -> Vec<MenuItem> {
+        vec![MenuItem::action("Open Files here", action::OPEN_FILES).with_hint("f")]
     }
 
     fn handle_app_event(&mut self, ev: &AppEvent, ctx: &mut ModeCtx) -> EventResult {
@@ -270,14 +319,17 @@ impl Mode for TerminalMode {
 
     fn handle_request(&mut self, request: &dyn std::any::Any, ctx: &mut ModeCtx) -> bool {
         let Some(req) = request.downcast_ref::<OpenTerminal>() else { return false };
-        let label = req.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
-        if req.cwd.is_dir() {
-            self.open_tab_at(req.cwd.clone(), Some(label));
+        let label = req.label.clone().unwrap_or_else(|| {
+            req.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into())
+        });
+        let cwd = if req.cwd.is_dir() {
+            req.cwd.clone()
         } else {
             // e.g. the in-memory demo file system: fall back to the start folder.
             ctx.toast(format!("{} does not exist on disk", req.cwd.display()), format!("Opened in {}", self.cwd.display()));
-            self.open_tab();
-        }
+            self.cwd.clone()
+        };
+        self.open_tab_at(cwd, Some(label), req.command.clone());
         true
     }
 

@@ -1,8 +1,9 @@
 //! One shell running in a pseudo-terminal, with its screen emulated by `vt100`.
 
 use std::io::{Read, Write};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
@@ -11,6 +12,10 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::event::EventSender;
 
 const SCROLLBACK: usize = 5_000;
+/// A queued command is typed once the shell has been quiet this long (its prompt is drawn)…
+const READY_QUIET: Duration = Duration::from_millis(300);
+/// …or after this long, whatever happens.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub enum TermEvent {
     /// New output is ready to draw.
@@ -74,7 +79,8 @@ pub fn default_shell() -> String {
 }
 
 impl TerminalSession {
-    pub fn spawn(id: u64, cwd: &Path, rows: u16, cols: u16, tx: EventSender) -> Result<Self> {
+    /// `typed`: text to type into the shell once it is ready (e.g. a command from "Run…").
+    pub fn spawn(id: u64, cwd: &Path, rows: u16, cols: u16, typed: Option<String>, tx: EventSender) -> Result<Self> {
         let (rows, cols) = (rows.max(2), cols.max(2));
         let pair = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -91,14 +97,37 @@ impl TerminalSession {
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
         let parser = Arc::new(Mutex::new(Parser::new_with_callbacks(rows, cols, SCROLLBACK, TermCallbacks::default())));
         let pending = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        // Milliseconds since `started` of the last output; 0 = nothing yet.
+        let last_output = Arc::new(AtomicU64::new(0));
 
-        let (p, flag, w) = (parser.clone(), pending.clone(), writer.clone());
+        if let Some(text) = typed {
+            // Typing before the prompt is drawn can be eaten by shell start-up (rc files,
+            // prompts that query the terminal), so wait until the output settles.
+            let (last, w) = (last_output.clone(), writer.clone());
+            std::thread::Builder::new().name(format!("pty-{id}-typed")).spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let elapsed = started.elapsed();
+                    let last = Duration::from_millis(last.load(Ordering::Acquire));
+                    let quiet = !last.is_zero() && elapsed.saturating_sub(last) >= READY_QUIET;
+                    if quiet || elapsed >= READY_TIMEOUT {
+                        break;
+                    }
+                }
+                let mut w = w.lock().expect("writer lock");
+                let _ = w.write_all(format!("{text}\r").as_bytes()).and_then(|_| w.flush());
+            })?;
+        }
+
+        let (p, flag, w, last) = (parser.clone(), pending.clone(), writer.clone(), last_output.clone());
         std::thread::Builder::new().name(format!("pty-{id}")).spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        last.store((started.elapsed().as_millis() as u64).max(1), Ordering::Release);
                         let (replies, clips) = {
                             let mut parser = p.lock().expect("parser lock");
                             parser.process(&buf[..n]);
@@ -125,6 +154,12 @@ impl TerminalSession {
         })?;
 
         Ok(Self { id, parser, master: pair.master, writer, child, size: (rows, cols), pending })
+    }
+
+    /// The folder the shell (or the program in the foreground) is in right now.
+    pub fn cwd(&self) -> Option<PathBuf> {
+        let foreground = self.master.process_group_leader().and_then(|p| u32::try_from(p).ok());
+        [foreground, self.child.process_id()].into_iter().flatten().find_map(process_cwd)
     }
 
     pub fn id(&self) -> u64 {
@@ -165,4 +200,17 @@ impl Drop for TerminalSession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Current folder of process `pid`: `/proc` on Linux, `lsof` elsewhere (macOS, for development).
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        return Some(path);
+    }
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix('n')).map(PathBuf::from).filter(|p| p.is_dir())
 }

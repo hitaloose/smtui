@@ -2,6 +2,7 @@ pub mod bars;
 pub mod dialog;
 pub mod hit;
 pub mod menu;
+pub mod run_dialog;
 pub mod terminal_guard;
 pub mod theme;
 pub mod toast;

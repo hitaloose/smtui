@@ -20,6 +20,7 @@ use crate::{
         hit::HitMap,
         dialog::{DialogHit, DialogState},
         menu::{MenuOwner, MenuState},
+        run_dialog::{RunDialogState, RunHit, RunOutcome},
         terminal_guard::Tui,
         toast::Toast,
     },
@@ -46,6 +47,8 @@ pub struct App {
     leader_pending: bool,
     menu: Option<MenuState>,
     dialog: Option<DialogState>,
+    run_dialog: Option<RunDialogState>,
+    run_history: crate::run::History,
     toast: Option<Toast>,
     chrome_hits: HitMap<ChromeTarget>,
     layout: AppLayout,
@@ -58,6 +61,9 @@ impl App {
             tracing::warn!(leader = %shared.config.leader, "invalid leader key, using ctrl-]");
             KeyChord::parse("ctrl-]").expect("valid default")
         });
+        // The demo keeps its Run history in memory only.
+        let run_history =
+            if shared.state.is_persistent() { crate::run::History::load_default() } else { crate::run::History::default() };
         Self {
             shared,
             modes,
@@ -66,6 +72,8 @@ impl App {
             leader_pending: false,
             menu: None,
             dialog: None,
+            run_dialog: None,
+            run_history,
             toast: None,
             chrome_hits: HitMap::default(),
             layout: AppLayout::default(),
@@ -147,6 +155,9 @@ impl App {
         if let Some(dialog) = &mut self.dialog {
             dialog.render(f, theme);
         }
+        if let Some(run) = &mut self.run_dialog {
+            run.render(f, theme);
+        }
     }
 
     // ---- Effects ----
@@ -167,6 +178,11 @@ impl App {
                     self.dialog = Some(DialogState::new(idx, c));
                 }
                 Effect::Toast { msg, detail } => self.toast = Some(Toast::new(msg, detail)),
+                Effect::Run(prompt) => {
+                    self.menu = None;
+                    let history = self.run_history.for_key(&prompt.key);
+                    self.run_dialog = Some(RunDialogState::new(prompt, history));
+                }
                 Effect::OpenMenu { x, y, items } => {
                     self.menu = (!items.is_empty()).then(|| MenuState::new(MenuOwner::Mode(idx), (x, y), items));
                 }
@@ -202,6 +218,11 @@ impl App {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Paste(text) if self.run_dialog.is_some() => {
+                if let Some(d) = &mut self.run_dialog {
+                    d.type_text(&text);
+                }
+            }
             Event::Paste(text) if self.dialog.is_some() => {
                 if let Some(d) = &mut self.dialog {
                     d.type_text(&text);
@@ -216,6 +237,22 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if let Some(run) = &mut self.run_dialog {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Esc => self.run_dialog = None,
+                KeyCode::Tab | KeyCode::BackTab => run.next_field(),
+                KeyCode::Up => run.browse_history(true),
+                KeyCode::Down => run.browse_history(false),
+                KeyCode::Enter => self.submit_run(),
+                KeyCode::Backspace => run.backspace(),
+                KeyCode::Char('w') if ctrl => run.delete_word(),
+                KeyCode::Char('u') if ctrl => run.clear_field(),
+                KeyCode::Char(c) if !ctrl => run.type_text(&c.to_string()),
+                _ => {}
+            }
+            return;
+        }
         if let Some(dialog) = &mut self.dialog {
             match key.code {
                 KeyCode::Esc => self.dialog = None,
@@ -292,6 +329,18 @@ impl App {
             KeyCode::Char(c @ '1'..='9') => self.switch_mode(c as usize - '1' as usize),
             KeyCode::Char('m') | KeyCode::Tab => self.switch_mode((self.active_mode + 1) % self.modes.len()),
             KeyCode::Char('?') | KeyCode::Char(' ') => self.open_shortcuts_menu_from_keyboard(),
+            // The mode's own shortcut items, by the key shown as their hint (e.g. `f` in Terminal).
+            KeyCode::Char(c) => {
+                let wanted = c.to_string();
+                let action = self.modes[self.active_mode].shortcut_items().into_iter().find_map(|it| match it {
+                    crate::modes::MenuItem::Action { hint, enabled: true, action, .. } if hint == wanted => Some(action),
+                    _ => None,
+                });
+                if let Some(action) = action {
+                    let i = self.active_mode;
+                    self.with_mode(i, |m, ctx| m.on_action(action, ctx));
+                }
+            }
             _ => {}
         }
     }
@@ -313,6 +362,19 @@ impl App {
 
     fn handle_mouse(&mut self, ev: MouseEvent) {
         let (x, y) = (ev.column, ev.row);
+        if let Some(run) = &mut self.run_dialog {
+            // Clicking outside does not close it, so typed text is never lost by accident.
+            if ev.kind == MouseEventKind::Down(MouseButton::Left) {
+                match run.hit(x, y) {
+                    Some(RunHit::Field(field)) => run.focus(field),
+                    Some(RunHit::Suggestion(i)) => run.use_suggestion(i),
+                    Some(RunHit::Cancel) => self.run_dialog = None,
+                    Some(RunHit::Run) => self.submit_run(),
+                    _ => {}
+                }
+            }
+            return;
+        }
         if let Some(dialog) = &mut self.dialog {
             if ev.kind == MouseEventKind::Down(MouseButton::Left) {
                 match dialog.hit(x, y) {
@@ -436,6 +498,21 @@ impl App {
             }
             a if a >= app_action::MODE_BASE => self.switch_mode((a - app_action::MODE_BASE) as usize),
             _ => {}
+        }
+    }
+
+    /// Enter / Run in the Run dialog: types the command into a new terminal tab.
+    fn submit_run(&mut self) {
+        let Some(run) = &mut self.run_dialog else { return };
+        match run.submit() {
+            RunOutcome::Stay => {}
+            RunOutcome::Run { command, prefix, args } => {
+                let Some(run) = self.run_dialog.take() else { return };
+                let p = run.prompt;
+                self.run_history.record(&p.key, &prefix, &args);
+                let label = crate::run::tab_label(&prefix, &p.paths);
+                self.route_request(&crate::modes::requests::OpenTerminal { cwd: p.cwd, command: Some(command), label: Some(label) });
+            }
         }
     }
 

@@ -44,6 +44,75 @@ pub fn archive_name(base: &str, taken: &HashSet<String>) -> String {
         .expect("an unused name always exists")
 }
 
+/// Archive formats smtui can extract. Tarballs go through `tar` (which detects the
+/// compression itself), zip files through `unzip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveKind {
+    Tar,
+    Zip,
+}
+
+/// Archive extensions, longest first, so `x.tar.gz` is not read as `x.tar` + `.gz`.
+const ARCHIVE_EXTS: &[(&str, ArchiveKind)] = &[
+    (".tar.gz", ArchiveKind::Tar),
+    (".tar.bz2", ArchiveKind::Tar),
+    (".tar.xz", ArchiveKind::Tar),
+    (".tar.zst", ArchiveKind::Tar),
+    (".tgz", ArchiveKind::Tar),
+    (".tbz2", ArchiveKind::Tar),
+    (".tbz", ArchiveKind::Tar),
+    (".txz", ArchiveKind::Tar),
+    (".tzst", ArchiveKind::Tar),
+    (".tar", ArchiveKind::Tar),
+    (".zip", ArchiveKind::Zip),
+];
+
+/// The archive format of a file name, if smtui can extract it.
+pub fn archive_kind(name: &str) -> Option<ArchiveKind> {
+    let lower = name.to_lowercase();
+    ARCHIVE_EXTS.iter().find(|(ext, _)| lower.len() > ext.len() && lower.ends_with(ext)).map(|(_, k)| *k)
+}
+
+/// The name without its archive extension: `backup.tar.gz` → `backup`.
+pub fn archive_stem(name: &str) -> &str {
+    let lower = name.to_lowercase();
+    match ARCHIVE_EXTS.iter().find(|(ext, _)| lower.len() > ext.len() && lower.ends_with(ext)) {
+        Some((ext, _)) => &name[..name.len() - ext.len()],
+        None => name,
+    }
+}
+
+/// A member path is safe when it stays inside the destination: not absolute, no `..`.
+pub fn safe_member(member: &str) -> bool {
+    let member = member.trim_end_matches('/');
+    !member.starts_with('/') && !member.split('/').any(|part| part == "..")
+}
+
+/// `base`, then `base (2)`, `base (3)`… until unused.
+pub fn numbered_name(base: &str, taken: &HashSet<String>) -> String {
+    (1..)
+        .map(|i| if i == 1 { base.to_string() } else { format!("{base} ({i})") })
+        .find(|c| !taken.contains(c))
+        .expect("an unused name always exists")
+}
+
+/// Where extracted content goes, so an archive never scatters files or overwrites anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// The archive holds a single top-level entry whose name is free: move it out as is.
+    Single(String),
+    /// Everything goes into a new folder named after the archive.
+    Folder(String),
+}
+
+/// `top`: the top-level entries the archive produced; `taken`: names already in the folder.
+pub fn place_extracted(top: &[String], stem: &str, taken: &HashSet<String>) -> Placement {
+    match top {
+        [one] if !taken.contains(one) => Placement::Single(one.clone()),
+        _ => Placement::Folder(numbered_name(if stem.is_empty() { "extracted" } else { stem }, taken)),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipOp {
     Copy,
@@ -440,5 +509,36 @@ mod tests {
         assert_eq!(human_size(3789), "3.7 KB");
         assert_eq!(human_size(2_516_582), "2.4 MB");
         assert_eq!(human_size(880_640), "860 KB");
+    }
+
+    #[test]
+    fn archive_kinds() {
+        assert_eq!(archive_kind("backup.tar.gz"), Some(ArchiveKind::Tar));
+        assert_eq!(archive_kind("BACKUP.TGZ"), Some(ArchiveKind::Tar));
+        assert_eq!(archive_kind("x.tar.zst"), Some(ArchiveKind::Tar));
+        assert_eq!(archive_kind("site.zip"), Some(ArchiveKind::Zip));
+        assert_eq!(archive_kind(".tar.gz"), None);
+        assert_eq!(archive_kind("notes.gz"), None);
+        assert_eq!(archive_kind("readme.txt"), None);
+        assert_eq!(archive_stem("backup (2).tar.gz"), "backup (2)");
+        assert_eq!(archive_stem("Site.ZIP"), "Site");
+    }
+
+    #[test]
+    fn unsafe_members() {
+        for ok in ["a.txt", "./a/b", "dir/", "a..b/c", "./"] {
+            assert!(safe_member(ok), "{ok}");
+        }
+        for bad in ["/etc/passwd", "../x", "a/../../x", "a/.."] {
+            assert!(!safe_member(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn extraction_placement() {
+        let taken: HashSet<String> = ["backup".into(), "app".into()].into();
+        assert_eq!(place_extracted(&["site".into()], "backup", &taken), Placement::Single("site".into()));
+        assert_eq!(place_extracted(&["app".into()], "backup", &taken), Placement::Folder("backup (2)".into()));
+        assert_eq!(place_extracted(&["a".into(), "b".into()], "logs", &taken), Placement::Folder("logs".into()));
     }
 }

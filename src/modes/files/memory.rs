@@ -43,7 +43,7 @@ impl MemoryFs {
         put("/home/deploy/apps/api", vec![f("server.js", 12_400, 1)]);
         put("/home/deploy/apps/worker", vec![f("worker.js", 6_100, 1)]);
         put("/home/deploy/logs", vec![f("app.log", 2_516_582, 0), f("nginx.log", 880_640, 0), f("deploy.log", 14_336, 1)]);
-        put("/home/deploy/backups", vec![]);
+        put("/home/deploy/backups", vec![f("site-2024-11-01.tar.gz", 48_201_113, 5)]);
         put("/etc", vec![d("nginx", 7), d("ssh", 55), f("hosts", 221, 55)]);
         put("/etc/nginx", vec![]);
         put("/etc/ssh", vec![]);
@@ -108,6 +108,24 @@ impl Fs for MemoryFs {
         }
         list.push(Entry { name: dest_name.into(), kind: EntryKind::File, size, modified: Some(SystemTime::now()), symlink: false });
         Ok(())
+    }
+
+    /// The demo has no archive contents: it creates an empty folder named after the archive.
+    fn extract(&self, archive: &Path) -> io::Result<std::ffi::OsString> {
+        let mut dirs = self.dirs.lock().expect("memory fs lock");
+        let (Some(parent), Some(name)) = (archive.parent(), archive.file_name()) else { return Err(not_found(archive)) };
+        let list = dirs.get(parent).ok_or_else(|| not_found(parent))?;
+        let taken: std::collections::HashSet<String> = list.iter().map(|e| e.name.to_string_lossy().into_owned()).collect();
+        let folder = super::ops::numbered_name(super::ops::archive_stem(&name.to_string_lossy()), &taken);
+        dirs.get_mut(parent).expect("checked").push(Entry {
+            name: folder.clone().into(),
+            kind: EntryKind::Dir,
+            size: 0,
+            modified: Some(SystemTime::now()),
+            symlink: false,
+        });
+        dirs.insert(parent.join(&folder), Vec::new());
+        Ok(folder.into())
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {

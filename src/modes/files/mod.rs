@@ -22,7 +22,7 @@ use self::{
     tab::FilesTab,
     view::FilesTarget,
 };
-use super::{EventResult, KeyHint, MenuItem, Mode, ModeCtx, Shared, TabInfo, requests::OpenTerminal};
+use super::{EventResult, KeyHint, MenuItem, Mode, ModeCtx, Shared, TabInfo, requests::{OpenFiles, OpenTerminal}};
 use crate::{clipboard, event::AppEvent, event::EventSender, ui::dialog::Confirm, ui::hit::HitMap};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -41,6 +41,8 @@ mod action {
     pub const TOGGLE_HIDDEN: u32 = 11;
     pub const UPLOAD: u32 = 12;
     pub const REFRESH: u32 = 13;
+    pub const RUN: u32 = 14;
+    pub const EXTRACT: u32 = 15;
 }
 
 enum FilesEvent {
@@ -48,6 +50,7 @@ enum FilesEvent {
     Pasted(PasteReport),
     Deleted(DeleteReport),
     Compressed { tab_id: u64, dir: PathBuf, result: Result<OsString, String> },
+    Extracted { tab_id: u64, dir: PathBuf, created: Vec<OsString>, errors: Vec<String> },
 }
 
 #[derive(Clone)]
@@ -90,6 +93,7 @@ pub struct FilesMode {
     pending_delete: Option<(PathBuf, Vec<(OsString, bool)>)>,
     deleting: bool,
     compressing: bool,
+    extracting: bool,
 }
 
 impl FilesMode {
@@ -102,7 +106,8 @@ impl FilesMode {
             next_id: 1,
             next_request: 1,
             clip: None,
-            show_hidden: shared.config.show_hidden,
+            // The last choice wins over the config default.
+            show_hidden: shared.state.load().show_hidden.unwrap_or(shared.config.show_hidden),
             pasting: false,
             hits: HitMap::default(),
             list_body: Rect::default(),
@@ -112,6 +117,7 @@ impl FilesMode {
             pending_delete: None,
             deleting: false,
             compressing: false,
+            extracting: false,
         };
         mode.open_tab(start);
         mode
@@ -413,6 +419,10 @@ impl FilesMode {
         if names.is_empty() {
             return;
         }
+        if all_archives(&tab.selected_entries()) {
+            ctx.toast("Already compressed", "Use Extract (e) to unpack it.");
+            return;
+        }
         let base = match names.as_slice() {
             [one] => one.to_string_lossy().into_owned(),
             _ => tab.title(),
@@ -442,6 +452,86 @@ impl FilesMode {
                 ctx.toast(format!("Created {}", name.to_string_lossy()), "");
             }
             Err(e) => ctx.toast("Could not create the archive", e.clone()),
+        }
+        let dir = dir.clone();
+        self.reload_where(|t| t.path == dir);
+    }
+
+    // ---- Run ----
+
+    /// Opens the "Run…" dialog for the selection. The command runs in a new terminal tab.
+    fn ask_run(&mut self, ctx: &mut ModeCtx) {
+        let tab = &self.tabs[self.active];
+        let paths: Vec<(PathBuf, bool)> = tab.selected_entries().iter().map(|e| (tab.path.join(&e.name), e.is_dir())).collect();
+        if paths.is_empty() {
+            return;
+        }
+        if let Some((bad, _)) = paths.iter().find(|(p, _)| crate::run::unsafe_name(p)) {
+            ctx.toast(
+                "Cannot run this file from here",
+                format!("Its name has control characters or invalid UTF-8: {}", bad.to_string_lossy().escape_debug()),
+            );
+            return;
+        }
+        let entries: Vec<_> = paths.into_iter().map(|(p, d)| { let f = crate::run::inspect(&p); (p, d, f) }).collect();
+        let as_root = crate::run::current_uid() == 0;
+        ctx.run(crate::run::prompt(tab.path.clone(), &entries, as_root));
+    }
+
+    // ---- Extract ----
+
+    /// Extracts each selected archive next to itself, one after the other.
+    fn extract(&mut self, ctx: &mut ModeCtx) {
+        if self.extracting {
+            ctx.toast("An extraction is already running", "");
+            return;
+        }
+        let tab = &self.tabs[self.active];
+        let archives: Vec<PathBuf> = tab
+            .selected_entries()
+            .iter()
+            .filter(|e| !e.is_dir() && ops::archive_kind(&e.name.to_string_lossy()).is_some())
+            .map(|e| tab.path.join(&e.name))
+            .collect();
+        if archives.is_empty() {
+            ctx.toast("Nothing to extract", "Select a .tar.gz, .tgz, .tar.bz2, .tar.xz, .tar.zst, .tar or .zip file.");
+            return;
+        }
+        self.extracting = true;
+        let what = match archives.as_slice() {
+            [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            many => format!("{} archives", many.len()),
+        };
+        ctx.toast(format!("Extracting {what}…"), "");
+        let (fs, tx, dir, tab_id) = (self.fs.clone(), self.tx.clone(), tab.path.clone(), tab.id);
+        std::thread::spawn(move || {
+            let (mut created, mut errors) = (Vec::new(), Vec::new());
+            for archive in archives {
+                match fs.extract(&archive) {
+                    Ok(name) => created.push(name),
+                    Err(e) => errors.push(format!("{}: {e}", archive.file_name().unwrap_or_default().to_string_lossy())),
+                }
+            }
+            tx.send(FilesEvent::Extracted { tab_id, dir, created, errors });
+        });
+    }
+
+    fn finish_extract(&mut self, tab_id: u64, dir: &PathBuf, created: &[OsString], errors: &[String], ctx: &mut ModeCtx) {
+        self.extracting = false;
+        if !created.is_empty() {
+            for tab in self.tabs.iter_mut().filter(|t| t.id == tab_id && &t.path == dir) {
+                tab.select_after_load = Some(created.iter().cloned().collect());
+            }
+        }
+        let detail = match errors {
+            [] => String::new(),
+            [one] => one.clone(),
+            [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
+        };
+        if created.is_empty() {
+            ctx.toast("Could not extract", detail);
+        } else {
+            ctx.toast(format!("Extracted to {}", label_for(created.iter())), detail);
         }
         let dir = dir.clone();
         self.reload_where(|t| t.path == dir);
@@ -482,6 +572,8 @@ impl FilesMode {
 
     fn toggle_hidden(&mut self, ctx: &mut ModeCtx) {
         self.show_hidden = !self.show_hidden;
+        let value = self.show_hidden;
+        ctx.shared.state.update(|s| s.show_hidden = Some(value));
         self.reload_where(|_| true);
         ctx.toast(if self.show_hidden { "Showing hidden files" } else { "Hiding hidden files" }, "Press . to toggle.");
     }
@@ -519,12 +611,22 @@ impl FilesMode {
             };
             items.push(paste.with_hint(paste_hint).enabled(can_paste));
             items.push(MenuItem::Separator);
-            items.push(MenuItem::action("Compress to .tar.gz", action::COMPRESS).with_hint("z").enabled(!self.compressing));
+            let archives = all_archives(&selected);
+            if archives {
+                let label = if n > 1 { format!("Extract {n} archives here") } else { "Extract here".to_string() };
+                items.push(MenuItem::action(label, action::EXTRACT).with_hint("e").enabled(!self.extracting));
+            }
+            // Compressing an archive again only wraps it: disabled, Extract is the useful action.
+            items.push(
+                MenuItem::action("Compress to .tar.gz", action::COMPRESS).with_hint("z").enabled(!self.compressing && !archives),
+            );
             items.push(MenuItem::action("Copy scp command", action::SCP));
             items.push(MenuItem::action(
                 if single_dir.is_some() { "Copy upload command" } else { "Copy upload command here" },
                 action::UPLOAD,
             ).with_hint("u"));
+            // Not first in the menu: a habitual "menu + Enter" must never start a command.
+            items.push(MenuItem::action(format!("Run…{suffix}"), action::RUN).with_hint("!"));
             items.push(match &single_dir {
                 Some(_) => MenuItem::action("Open in terminal", action::TERMINAL),
                 None => MenuItem::action("Open terminal here", action::TERMINAL),
@@ -605,6 +707,11 @@ impl FilesMode {
             _ => {}
         }
     }
+}
+
+/// True when every selected entry is an archive file smtui can extract.
+fn all_archives(entries: &[&Entry]) -> bool {
+    !entries.is_empty() && entries.iter().all(|e| !e.is_dir() && ops::archive_kind(&e.name.to_string_lossy()).is_some())
 }
 
 fn label_for<'a>(names: impl Iterator<Item = &'a OsString>) -> String {
@@ -719,12 +826,20 @@ impl Mode for FilesMode {
                     Some(e) if e.is_dir() && tab.selection.contains(&e.name) => tab.path.join(&e.name),
                     _ => tab.path.clone(),
                 };
-                ctx.request(OpenTerminal { cwd });
+                ctx.request(OpenTerminal::at(cwd));
             }
             KeyCode::Char('.') => self.toggle_hidden(ctx),
+            KeyCode::Char('!') => {
+                self.ensure_selection();
+                self.ask_run(ctx);
+            }
             KeyCode::Char('u') if !ctrl => {
                 let dest = self.upload_destination();
                 self.copy_upload(&[ops::LOCAL_PATH_PLACEHOLDER.to_string()], dest, false, ctx);
+            }
+            KeyCode::Char('e') if !ctrl => {
+                self.ensure_selection();
+                self.extract(ctx);
             }
             KeyCode::Char('z') if !ctrl => {
                 self.ensure_selection();
@@ -805,6 +920,7 @@ impl Mode for FilesMode {
             }
             FilesEvent::Deleted(report) => self.finish_delete(report.clone(), ctx),
             FilesEvent::Compressed { tab_id, dir, result } => self.finish_compress(*tab_id, dir, result, ctx),
+            FilesEvent::Extracted { tab_id, dir, created, errors } => self.finish_extract(*tab_id, dir, created, errors, ctx),
             FilesEvent::Pasted(report) => {
                 self.finish_paste(report.clone(), ctx);
             }
@@ -833,8 +949,10 @@ impl Mode for FilesMode {
             action::SCP => self.copy_scp(ctx),
             action::DELETE => self.ask_delete(ctx),
             action::COMPRESS => self.compress(ctx),
+            action::EXTRACT => self.extract(ctx),
             action::TOGGLE_HIDDEN => self.toggle_hidden(ctx),
             action::REFRESH => self.load(self.active),
+            action::RUN => self.ask_run(ctx),
             action::UPLOAD => {
                 let dest = self.menu_folder.clone().unwrap_or_else(|| self.upload_destination());
                 self.copy_upload(&[ops::LOCAL_PATH_PLACEHOLDER.to_string()], dest, false, ctx);
@@ -842,11 +960,20 @@ impl Mode for FilesMode {
             action::DELETE_CONFIRMED => self.delete(),
             action::TERMINAL => {
                 if let Some(cwd) = self.menu_folder.clone() {
-                    ctx.request(OpenTerminal { cwd });
+                    ctx.request(OpenTerminal::at(cwd));
                 }
             }
             _ => {}
         }
+    }
+
+    fn handle_request(&mut self, request: &dyn std::any::Any, _ctx: &mut ModeCtx) -> bool {
+        let Some(req) = request.downcast_ref::<OpenFiles>() else { return false };
+        match self.tabs.iter().position(|t| t.path == req.path) {
+            Some(i) => self.select_tab(i),
+            None => self.open_tab(req.path.clone()),
+        }
+        true
     }
 
     fn status(&self, shared: &Shared) -> String {
@@ -867,6 +994,8 @@ impl Mode for FilesMode {
             " · deleting…"
         } else if self.compressing {
             " · compressing…"
+        } else if self.extracting {
+            " · extracting…"
         } else {
             ""
         };

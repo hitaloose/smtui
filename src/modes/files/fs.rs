@@ -38,4 +38,7 @@ pub trait Fs: Send + Sync {
     fn remove(&self, path: &Path) -> io::Result<()>;
     /// Creates the gzip-compressed tarball `dest` from the entries `names` of `dir`; fails if `dest` exists.
     fn compress(&self, dir: &Path, names: &[std::ffi::OsString], dest: &Path) -> io::Result<()>;
+    /// Extracts `archive` into its folder without overwriting anything (see
+    /// [`super::ops::place_extracted`]) and returns the name of the entry it created.
+    fn extract(&self, archive: &Path) -> io::Result<OsString>;
 }

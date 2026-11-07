@@ -5,8 +5,10 @@
 A terminal UI that runs **on the server**, with mouse and keyboard support. It has two modes:
 
 - **Terminal**: real local shells (`$SHELL -l`) in tabs, using a PTY plus a VT100 emulator.
-- **Files**: a file browser with tabs, multi-selection, two-step copy/move/paste and a
-  "Copy scp command" action for downloading files to your machine.
+  "Open Files here" shows the shell's current folder in the file browser.
+- **Files**: a file browser with tabs, multi-selection, two-step copy/move/paste, "Run…" to
+  run a command on a file in a new terminal tab, and a "Copy scp command" action for
+  downloading files to your machine.
 
 The usual workflow:
 
@@ -78,6 +80,7 @@ XON flow-control key in most shells and rarely used).
 | `Ctrl+]` then `n` / `p` | Next / previous tab |
 | `Ctrl+]` then `1`…`9` | Switch mode |
 | `Ctrl+]` then `?` (or `?` in Files) | Shortcuts menu |
+| `Ctrl+]` then `f`, or right click in a shell | Open Files in the shell's current folder |
 | `Ctrl+Q` (any mode), `Ctrl+]` then `q`, or the **Quit** button | Quit |
 | `Ctrl+]` `Ctrl+]` | Send `Ctrl+]` to the shell |
 | `Ctrl+T`, `Ctrl+W`, `Tab` / `Shift+Tab`, `F1`/`F2`, `q` | Same, in Files mode |
@@ -101,8 +104,10 @@ XON flow-control key in most shells and rarely used).
 | `s` | Copy scp command |
 | Drop files on the window | Copy an `scp` command that uploads them into the open folder (or the selected one) |
 | `u` | Copy an upload command with a `<LOCAL_PATH>` placeholder |
-| `z` | Compress the selection to `name.tar.gz` (never overwrites: `name (2).tar.gz`…) |
+| `z` | Compress the selection to `name.tar.gz` (never overwrites: `name (2).tar.gz`…); disabled for archives |
+| `e` | Extract the selected archives (`.tar.gz` `.tgz` `.tar.bz2` `.tar.xz` `.tar.zst` `.tar` `.zip`) next to them |
 | `t` | Open a terminal tab in the selected folder (or the current one) |
+| `!` | Run… a command on the selection in a new terminal tab (see below) |
 | `.` | Toggle hidden files (also in the Shortcuts menu) |
 | `r`, the **↻** button | Refresh the folder (e.g. after an upload) |
 | `Delete`, `d` | Delete the selection (asks you to type `DELETE` to confirm) |
@@ -113,6 +118,22 @@ terminal window while in Files mode. Terminals paste the dropped paths as text; 
 into `scp -r <your files> user@host:<open folder>/`, copies it to your clipboard, and you run it in
 a local terminal. "Copy upload command" in the context menu (or `u`) does the same with a
 `<LOCAL_PATH>` placeholder.
+
+**Run…** (`!` or the context menu) opens a dialog with three lines: the command (`vim`,
+`less +F`, `python3`…), the selected path (always quoted, never editable) and extra arguments.
+It shows the exact command line before running it, then types it into a new terminal tab in the
+file's folder, so it is in your shell history and `Ctrl+C` works. Suggestions depend on the file
+type, and `↑`/`↓` bring back what you ran last for that type (stored in
+`~/.local/state/smtui/run_history.tsv`, readable only by you). Commands that look destructive
+(`rm`, `dd`, `mkfs`, `> file`…) need a second Enter; the dialog also warns when smtui runs as
+root, when an executable belongs to another user or a file is writable by anyone. Files whose
+names contain control characters cannot be run from here.
+
+**Extract** never overwrites or scatters files. smtui first lists the archive and refuses it if
+any member has an absolute path or `..`; then it extracts into a new hidden folder (without
+restoring the archive's file owners) and moves the result into place: an archive with a single
+top-level folder becomes that folder (`site/`), anything else goes into a folder named after the
+archive (`backup/`); if the name is taken, `backup (2)`. Zip files need `unzip` on the server.
 
 Copy and Move work in two steps: mark the items, open the destination (in any tab) and Paste.
 Name clashes become `name (copy)`, `name (copy 2)`…; moving into the same folder and pasting a
@@ -128,7 +149,7 @@ folder into itself are skipped with a notice. Tabs open inside a moved folder fo
 ```toml
 accent = "#5eead4"     # highlight color
 leader = "ctrl-]"      # prefix for global shortcuts in Terminal mode
-show_hidden = true     # show dotfiles
+show_hidden = true     # show dotfiles at first; then smtui remembers your last toggle
 # truecolor = true     # force 24-bit color (auto-detected from $COLORTERM)
 
 [scp]                  # how *you* reach this server, for the copied scp command
@@ -137,7 +158,8 @@ show_hidden = true     # show dotfiles
 # port = 22            # default: port from $SSH_CONNECTION; `-P` is added when not 22
 ```
 
-Logs go to `~/.local/state/smtui/smtui.log` (level via `SMTUI_LOG=debug`).
+Logs go to `~/.local/state/smtui/smtui.log` (level via `SMTUI_LOG=debug`). The same folder keeps
+the last hidden-files choice (`state.toml`) and the Run history (`run_history.tsv`).
 
 ## Development
 

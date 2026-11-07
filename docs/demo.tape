@@ -78,9 +78,35 @@ Sleep 800ms
 Enter
 Sleep 2.2s
 
-# Upload command for a folder: run it on your computer (dropping files on the window works too)
+# Archives: the context menu offers Extract (and Compress is disabled)
+Type "g"
+Sleep 400ms
+Type "o"
+Sleep 2.2s
+Escape
+Sleep 300ms
+Type "e"
+Sleep 2.2s
+
+# Run…: build a command for a file; it would run in a new terminal tab
 Backspace
 Sleep 800ms
+Type "G"
+Sleep 400ms
+Type "!"
+Sleep 1.2s
+Ctrl+U
+Type "tail"
+Sleep 300ms
+Tab
+Type "-n 50"
+Sleep 2.5s
+Escape
+Sleep 600ms
+
+# Upload command for a folder: run it on your computer (dropping files on the window works too)
+Type "g"
+Sleep 400ms
 Space
 Sleep 400ms
 Type "u"

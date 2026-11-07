@@ -110,6 +110,8 @@ pub enum Effect {
     Confirm(Confirm),
     /// Offered to every mode; the first one that accepts it becomes the active mode.
     Request(Box<dyn Any>),
+    /// The "Run…" dialog; on accept the command runs in a new terminal tab.
+    Run(crate::run::RunPrompt),
 }
 
 /// App-wide state that modes may read.
@@ -118,6 +120,8 @@ pub struct Shared {
     pub config: Config,
     pub host: HostInfo,
     pub tx: EventSender,
+    /// Preferences remembered between runs.
+    pub state: crate::state::StateStore,
 }
 
 pub struct ModeCtx<'a> {
@@ -142,6 +146,11 @@ impl<'a> ModeCtx<'a> {
 
     pub fn confirm(&mut self, confirm: Confirm) {
         self.effects.push(Effect::Confirm(confirm));
+    }
+
+    /// Opens the "Run…" dialog for files.
+    pub fn run(&mut self, prompt: crate::run::RunPrompt) {
+        self.effects.push(Effect::Run(prompt));
     }
 
     /// Sends a request (see [`requests`]) to the mode that handles it and switches to that mode.
