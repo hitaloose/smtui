@@ -52,7 +52,9 @@ Sleep 300ms
 Space
 Sleep 800ms
 Type "o"
-Sleep 1.5s
+Sleep 1.2s
+Down
+Sleep 500ms
 Enter
 Sleep 1.5s
 

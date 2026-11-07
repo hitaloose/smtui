@@ -597,6 +597,9 @@ impl FilesMode {
         let mut items = Vec::new();
         self.menu_into = None;
         if on_item && n > 0 {
+            // First, but harmless on a stray Enter: it only opens the dialog, which needs its own Enter.
+            items.push(MenuItem::action(format!("Run…{suffix}"), action::RUN).with_hint("!"));
+            items.push(MenuItem::Separator);
             if single_dir.is_some() {
                 items.push(MenuItem::action("Open", action::OPEN));
             }
@@ -625,8 +628,6 @@ impl FilesMode {
                 if single_dir.is_some() { "Copy upload command" } else { "Copy upload command here" },
                 action::UPLOAD,
             ).with_hint("u"));
-            // Not first in the menu: a habitual "menu + Enter" must never start a command.
-            items.push(MenuItem::action(format!("Run…{suffix}"), action::RUN).with_hint("!"));
             items.push(match &single_dir {
                 Some(_) => MenuItem::action("Open in terminal", action::TERMINAL),
                 None => MenuItem::action("Open terminal here", action::TERMINAL),
