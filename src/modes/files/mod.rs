@@ -54,6 +54,8 @@ mod action {
     pub const NEW_FOLDER_NAMED: u32 = 17;
     pub const NEW_FILE: u32 = 18;
     pub const NEW_FILE_NAMED: u32 = 19;
+    pub const RENAME: u32 = 20;
+    pub const RENAME_NAMED: u32 = 21;
 }
 
 enum FilesEvent {
@@ -63,6 +65,7 @@ enum FilesEvent {
     Compressed { tab_id: u64, dir: PathBuf, result: Result<OsString, String> },
     Extracted { tab_id: u64, dir: PathBuf, created: Vec<OsString>, errors: Vec<String> },
     Created { tab_id: u64, dir: PathBuf, name: OsString, folder: bool, result: Result<(), String> },
+    Renamed { tab_id: u64, dir: PathBuf, old: OsString, new: OsString, is_dir: bool, result: Result<(), String> },
 }
 
 #[derive(Clone)]
@@ -103,6 +106,8 @@ pub struct FilesMode {
     menu_folder: Option<PathBuf>,
     /// Entries waiting for the delete confirmation: (folder, [(name, is_dir)]).
     pending_delete: Option<(PathBuf, Vec<(OsString, bool)>)>,
+    /// Entry waiting for its new name: (folder, name, is_dir).
+    pending_rename: Option<(PathBuf, OsString, bool)>,
     deleting: bool,
     /// Keys go here: the cursor row is only highlighted when focused.
     pub focused: bool,
@@ -131,6 +136,7 @@ impl FilesMode {
             menu_into: None,
             menu_folder: None,
             pending_delete: None,
+            pending_rename: None,
             deleting: false,
             focused: true,
             dragging_scrollbar: false,
@@ -704,6 +710,87 @@ impl FilesMode {
         self.reload_where(|t| t.path == dir);
     }
 
+    // ---- Rename ----
+
+    /// Asks for the new name of the single selected entry.
+    fn ask_rename(&mut self, ctx: &mut ModeCtx) {
+        let tab = &self.tabs[self.active];
+        let (name, is_dir) = match tab.selected_entries().as_slice() {
+            [one] => (one.name.clone(), one.is_dir()),
+            [] => return,
+            _ => {
+                ctx.toast("Select one item to rename", "");
+                return;
+            }
+        };
+        let shown = name.to_string_lossy().into_owned();
+        ctx.confirm(Confirm {
+            title: "Rename".into(),
+            message: format!("Rename {shown}{} in {}.", if is_dir { "/" } else { "" }, tab.path.display()),
+            items: Vec::new(),
+            confirm_label: "Rename".into(),
+            danger: false,
+            require_text: None,
+            text: Some(TextInput { label: "New name:".into(), initial: shown, validate: ops::new_name_problem }),
+            action: action::RENAME_NAMED,
+        });
+        self.pending_rename = Some((tab.path.clone(), name, is_dir));
+    }
+
+    fn rename(&mut self, text: &str) {
+        let Some((dir, old, is_dir)) = self.pending_rename.take() else { return };
+        let new = OsString::from(text);
+        if new == old {
+            return;
+        }
+        let (fs, tx, tab_id) = (self.fs.clone(), self.tx.clone(), self.tabs[self.active].id);
+        std::thread::spawn(move || {
+            let result = fs.move_to(&dir.join(&old), &dir.join(&new)).map_err(|e| e.to_string());
+            tx.send(FilesEvent::Renamed { tab_id, dir, old, new, is_dir, result });
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_rename(
+        &mut self,
+        tab_id: u64,
+        dir: &Path,
+        old: &OsString,
+        new: &OsString,
+        is_dir: bool,
+        result: &Result<(), String>,
+        ctx: &mut ModeCtx,
+    ) {
+        let slash = if is_dir { "/" } else { "" };
+        let (old_shown, new_shown) = (old.to_string_lossy(), new.to_string_lossy());
+        if let Err(e) = result {
+            ctx.toast(format!("Could not rename {old_shown}{slash}"), e.clone());
+            return;
+        }
+        let (src, dst) = (dir.join(old), dir.join(new));
+        let mut moved = Vec::new();
+        if is_dir {
+            // Tabs open inside the renamed folder follow it.
+            for tab in &mut self.tabs {
+                if let Some(p) = ops::rewrite_path(&tab.path, &src, &dst) {
+                    tab.path = p.clone();
+                    moved.push(p);
+                }
+            }
+        }
+        if let Some(clip) = &mut self.clip {
+            ops::rename_in_clip(clip, dir, old, new);
+        }
+        for tab in self.tabs.iter_mut().filter(|t| t.path == dir) {
+            tab.selection.remove(old);
+            if tab.id == tab_id {
+                tab.select_after_load = Some(BTreeSet::from([new.clone()]));
+            }
+        }
+        self.reload_where(|t| t.path == dir || moved.contains(&t.path));
+        ctx.toast(format!("Renamed {old_shown}{slash} → {new_shown}{slash}"), "");
+    }
+
     fn toggle_hidden(&mut self, ctx: &mut ModeCtx) {
         self.show_hidden = !self.show_hidden;
         let value = self.show_hidden;
@@ -745,6 +832,7 @@ impl FilesMode {
             items.push(MenuItem::Separator);
             items.push(MenuItem::action(format!("Copy{suffix}"), action::COPY).with_hint("c"));
             items.push(MenuItem::action(format!("Move{suffix}"), action::MOVE).with_hint("m"));
+            items.push(MenuItem::action("Rename…", action::RENAME).with_hint("F2").enabled(n == 1));
             let paste = match &single_dir {
                 Some(dir) => {
                     self.menu_into = Some(dir.clone());
@@ -934,6 +1022,10 @@ impl Pane for FilesMode {
             KeyCode::Char('.') => self.toggle_hidden(ctx),
             KeyCode::Char('n') if !ctrl => self.ask_new(true, ctx),
             KeyCode::Char('f') if !ctrl => self.ask_new(false, ctx),
+            KeyCode::F(2) => {
+                self.ensure_selection();
+                self.ask_rename(ctx);
+            }
             KeyCode::Char('!') => {
                 self.ensure_selection();
                 self.ask_run(ctx);
@@ -1032,6 +1124,9 @@ impl Pane for FilesMode {
             FilesEvent::Created { tab_id, dir, name, folder, result } => {
                 self.finish_create(*tab_id, dir, name, *folder, result, ctx)
             }
+            FilesEvent::Renamed { tab_id, dir, old, new, is_dir, result } => {
+                self.finish_rename(*tab_id, dir, old, new, *is_dir, result, ctx)
+            }
             FilesEvent::Pasted(report) => {
                 self.finish_paste(report.clone(), ctx);
             }
@@ -1071,6 +1166,7 @@ impl Pane for FilesMode {
             action::DELETE_CONFIRMED => self.delete(),
             action::NEW_FOLDER => self.ask_new(true, ctx),
             action::NEW_FILE => self.ask_new(false, ctx),
+            action::RENAME => self.ask_rename(ctx),
             action::TERMINAL => {
                 if let Some(cwd) = self.menu_folder.clone() {
                     ctx.request(OpenTab { cwd });
@@ -1084,6 +1180,7 @@ impl Pane for FilesMode {
         match action {
             action::NEW_FOLDER_NAMED => self.create(text, true),
             action::NEW_FILE_NAMED => self.create(text, false),
+            action::RENAME_NAMED => self.rename(text),
             _ => {}
         }
     }

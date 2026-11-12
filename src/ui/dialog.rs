@@ -1,6 +1,7 @@
 //! Modal confirmation dialog drawn over everything. Focus starts on Cancel so a stray
 //! Enter never confirms; destructive actions can also require typing a word (e.g. DELETE).
 
+use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
@@ -56,6 +57,8 @@ pub struct DialogState {
     input: String,
     /// The suggested text is selected: the first key typed replaces it.
     selected: bool,
+    /// Cursor position in the free text field, in chars (the confirm word is always typed at the end).
+    cursor: usize,
     rect: Rect,
     cancel_rect: Rect,
     confirm_rect: Rect,
@@ -69,6 +72,7 @@ impl DialogState {
             // A text dialog confirms with Enter, so the confirm button starts focused.
             focus_confirm: confirm.text.is_some(),
             selected: !input.is_empty(),
+            cursor: input.chars().count(),
             confirm,
             input,
             rect: Rect::default(),
@@ -93,35 +97,82 @@ impl DialogState {
         self.confirm.require_text.is_some() || self.confirm.text.is_some()
     }
 
+    /// Byte offset of the cursor in `input`.
+    fn cursor_byte(&self) -> usize {
+        self.input.char_indices().nth(self.cursor).map_or(self.input.len(), |(i, _)| i)
+    }
+
+    fn len_chars(&self) -> usize {
+        self.input.chars().count()
+    }
+
     pub fn type_text(&mut self, text: &str) {
-        if self.has_input() {
-            if std::mem::take(&mut self.selected) {
-                self.input.clear();
+        if !self.has_input() {
+            return;
+        }
+        if std::mem::take(&mut self.selected) {
+            self.clear_input();
+        }
+        if self.confirm.text.is_none() {
+            self.cursor = self.len_chars();
+        }
+        let max = if self.confirm.text.is_some() { 255 } else { 64 };
+        for c in text.chars().filter(|c| !c.is_control()) {
+            if self.input.len() + c.len_utf8() > max {
+                break;
             }
-            let max = if self.confirm.text.is_some() { 255 } else { 64 };
-            self.input.extend(text.chars().filter(|c| !c.is_control()));
-            while self.input.len() > max {
-                self.input.pop();
-            }
+            let at = self.cursor_byte();
+            self.input.insert(at, c);
+            self.cursor += 1;
         }
     }
 
     pub fn backspace(&mut self) {
         if std::mem::take(&mut self.selected) {
-            self.input.clear();
-        } else {
+            self.clear_input();
+        } else if self.confirm.text.is_none() {
             self.input.pop();
+            self.cursor = self.len_chars();
+        } else if self.cursor > 0 {
+            self.cursor -= 1;
+            let at = self.cursor_byte();
+            self.input.remove(at);
         }
     }
 
-    /// ←/→ keep the suggested text and continue editing at its end.
-    pub fn deselect(&mut self) {
-        self.selected = false;
+    /// Delete: removes the char after the cursor (the whole suggestion when it is selected).
+    pub fn delete_forward(&mut self) {
+        if std::mem::take(&mut self.selected) {
+            self.clear_input();
+        } else if self.cursor < self.len_chars() {
+            let at = self.cursor_byte();
+            self.input.remove(at);
+        }
+    }
+
+    /// ←/→/Home/End keep the text and move the cursor. On the selected suggestion,
+    /// ← and Home go to its start, → and End to its end (like an editor).
+    pub fn move_cursor(&mut self, key: KeyCode) {
+        let was_selected = std::mem::take(&mut self.selected);
+        if self.confirm.text.is_none() {
+            return;
+        }
+        let len = self.len_chars();
+        self.cursor = match key {
+            KeyCode::Home => 0,
+            KeyCode::End => len,
+            KeyCode::Left if was_selected => 0,
+            KeyCode::Right if was_selected => len,
+            KeyCode::Left => self.cursor.saturating_sub(1),
+            KeyCode::Right => (self.cursor + 1).min(len),
+            _ => self.cursor,
+        };
     }
 
     /// Ctrl+U: clears the field.
     pub fn clear_input(&mut self) {
         self.input.clear();
+        self.cursor = 0;
         self.selected = false;
     }
 
@@ -217,18 +268,30 @@ impl DialogState {
                 Rect::new(inner.x, y, inner.width, 1),
             );
             let field = Rect::new(inner.x, y + 1, inner.width, 1);
-            let shown = crate::ui::bars::truncate_start(&self.input, inner.width.saturating_sub(4) as usize);
-            // Selected text looks like a selection in an editor: typing replaces it.
-            let (text_style, cursor) = if self.selected {
-                (Style::new().fg(theme.fg).bg(theme.accent_tint), Span::raw(""))
+            let width = inner.width.saturating_sub(3).max(1) as usize;
+            let mut spans = vec![Span::raw(" ")];
+            if self.selected {
+                // Selected text looks like a selection in an editor: typing replaces it.
+                let shown = crate::ui::bars::truncate_start(&self.input, width);
+                spans.push(Span::styled(shown, Style::new().fg(theme.fg).bg(theme.accent_tint)));
             } else {
-                (Style::new().fg(theme.fg), Span::styled("█", Style::new().fg(theme.accent)))
-            };
-            f.render_widget(
-                Paragraph::new(Line::from(vec![Span::styled(" ", Style::new()), Span::styled(shown, text_style), cursor]))
-                .style(Style::new().bg(theme.bg)),
-                field,
-            );
+                let chars: Vec<char> = self.input.chars().collect();
+                // Scroll so the cursor (one cell past the end at most) stays visible.
+                let start = (self.cursor + 1).saturating_sub(width);
+                let end = (start + width).min(chars.len());
+                let text = Style::new().fg(theme.fg);
+                let before: String = chars[start..self.cursor].iter().collect();
+                spans.push(Span::styled(before, text));
+                match chars.get(self.cursor) {
+                    Some(c) => {
+                        spans.push(Span::styled(c.to_string(), Style::new().fg(theme.bg).bg(theme.accent)));
+                        let after: String = chars[self.cursor + 1..end.max(self.cursor + 1)].iter().collect();
+                        spans.push(Span::styled(after, text));
+                    }
+                    None => spans.push(Span::styled("█", Style::new().fg(theme.accent))),
+                }
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)).style(Style::new().bg(theme.bg)), field);
             if let Some(problem) = self.text_problem().filter(|_| !self.input.is_empty()) {
                 f.render_widget(
                     Paragraph::new(Span::styled(problem, Style::new().fg(theme.danger))),
@@ -326,10 +389,32 @@ mod tests {
         assert!(!d.can_confirm());
 
         let mut d = name_dialog();
-        d.deselect();
+        d.move_cursor(KeyCode::Right);
         d.type_text("x");
         assert_eq!(d.text(), Some("New file.txtx"));
         d.backspace();
         assert_eq!(d.text(), Some("New file.txt"));
+    }
+
+    #[test]
+    fn arrows_move_the_cursor_inside_the_name() {
+        let mut d = name_dialog();
+        // ← on the selection goes to the start.
+        d.move_cursor(KeyCode::Left);
+        d.type_text("My ");
+        assert_eq!(d.text(), Some("My New file.txt"));
+        // Before ".txt": End, then 4 × ←.
+        d.move_cursor(KeyCode::End);
+        for _ in 0..4 {
+            d.move_cursor(KeyCode::Left);
+        }
+        d.backspace();
+        d.type_text("é");
+        assert_eq!(d.text(), Some("My New filé.txt"));
+        d.delete_forward();
+        assert_eq!(d.text(), Some("My New filétxt"));
+        d.move_cursor(KeyCode::Home);
+        d.delete_forward();
+        assert_eq!(d.text(), Some("y New filétxt"));
     }
 }

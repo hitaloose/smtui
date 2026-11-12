@@ -388,7 +388,8 @@ impl App {
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right if !dialog.has_input() => {
                     dialog.toggle_focus()
                 }
-                KeyCode::Left | KeyCode::Right | KeyCode::End | KeyCode::Home => dialog.deselect(),
+                KeyCode::Left | KeyCode::Right | KeyCode::End | KeyCode::Home => dialog.move_cursor(key.code),
+                KeyCode::Delete => dialog.delete_forward(),
                 KeyCode::Enter => {
                     let confirm = if dialog.has_input() { dialog.can_confirm() } else { dialog.confirm_focused() };
                     if confirm {

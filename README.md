@@ -144,8 +144,9 @@ Full screen gives the keys to the terminal; minimizing gives them to Files.
 | `Backspace`, `←` | Up one level |
 | `Ctrl+A` / `Esc` | Select all / clear selection |
 | Right click, `o`, `Menu`, `Shift+F10` | Context menu |
-| `n` / `f` | New folder / new empty file (asks for the name; type over the suggestion, `←`/`→` to edit it instead) |
+| `n` / `f` | New folder / new empty file (asks for the name; type over the suggestion, or move with `←` `→` `Home` `End` to edit it) |
 | `c` / `m` | Copy / Move (mark the items, then Paste in the destination) |
+| `F2` | Rename the selected item (never overwrites an existing name; disabled in the context menu with several items selected) |
 | `v` | Paste here |
 | `s` | Copy scp command |
 | Drop files on the window | Copy an `scp` command that uploads them into the open folder (or the selected one) |

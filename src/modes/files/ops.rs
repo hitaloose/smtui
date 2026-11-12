@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -213,6 +213,17 @@ pub fn rewrite_path(path: &Path, src: &Path, dst: &Path) -> Option<PathBuf> {
     Some(if rest.as_os_str().is_empty() { dst.to_path_buf() } else { dst.join(rest) })
 }
 
+/// Keeps the copy/move area pointing at an entry renamed from `dir/old` to `dir/new`.
+pub fn rename_in_clip(clip: &mut Clip, dir: &Path, old: &OsStr, new: &OsStr) {
+    if clip.dir == dir {
+        for item in clip.items.iter_mut().filter(|i| i.name == old) {
+            item.name = new.to_os_string();
+        }
+    } else if let Some(p) = rewrite_path(&clip.dir, &dir.join(old), &dir.join(new)) {
+        clip.dir = p;
+    }
+}
+
 /// Quotes for POSIX shells unless the string only has safe characters.
 pub fn shell_quote(s: &str) -> Cow<'_, str> {
     let safe = !s.is_empty()
@@ -374,6 +385,22 @@ pub fn format_modified(time: Option<SystemTime>, now: DateTime<Local>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_keeps_the_clip() {
+        let item = |n: &str| ClipItem { name: n.into(), is_dir: false };
+        let mut clip = Clip { op: ClipOp::Copy, dir: "/srv".into(), items: vec![item("a"), item("b")] };
+        rename_in_clip(&mut clip, Path::new("/srv"), OsStr::new("a"), OsStr::new("c"));
+        assert_eq!(clip.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>(), ["c", "b"]);
+
+        let mut clip = Clip { op: ClipOp::Move, dir: "/srv/site/www".into(), items: vec![item("x")] };
+        rename_in_clip(&mut clip, Path::new("/srv"), OsStr::new("site"), OsStr::new("app"));
+        assert_eq!(clip.dir, Path::new("/srv/app/www"));
+
+        let mut clip = Clip { op: ClipOp::Move, dir: "/srv/sites".into(), items: vec![item("x")] };
+        rename_in_clip(&mut clip, Path::new("/srv"), OsStr::new("site"), OsStr::new("app"));
+        assert_eq!(clip.dir, Path::new("/srv/sites"));
+    }
 
     #[test]
     fn new_folder_names() {
