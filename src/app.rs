@@ -401,10 +401,18 @@ impl App {
                         self.menu = None;
                     }
                 }
-                MouseEventKind::Down(_) if !menu.contains(x, y) => self.menu = None,
+                // A right click elsewhere moves the menu there instead of only closing it,
+                // so right-clicking file after file opens a menu every time.
+                MouseEventKind::Down(MouseButton::Right) if !menu.contains(x, y) => self.menu = None,
+                MouseEventKind::Down(_) if !menu.contains(x, y) => {
+                    self.menu = None;
+                    return;
+                }
                 _ => {}
             }
-            return;
+            if !(ev.kind == MouseEventKind::Down(MouseButton::Right) && self.menu.is_none()) {
+                return;
+            }
         }
 
         let on_chrome = |r: ratatui::layout::Rect| r.contains((x, y).into());

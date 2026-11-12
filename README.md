@@ -63,6 +63,11 @@ Selection › Applications in terminal may access clipboard*; kitty, WezTerm, Al
 Terminal and recent GNOME terminals support it). If nothing reaches the clipboard, the command is
 always shown on screen so you can copy it by hand.
 
+iTerm2 opens its own context menu on right click by default, even when the app asks for the mouse.
+To send right clicks to smtui, enable *Settings › Pointer › Right-click reported to apps* (and
+*Ctrl-click reported to apps* if you use Ctrl-click), or run
+`defaults write com.googlecode.iterm2 ReportRightClick -bool true` and restart iTerm2.
+
 ## Keys
 
 The mouse works everywhere: click tabs, `×` closes a tab, `+` opens one, the bottom bar switches
