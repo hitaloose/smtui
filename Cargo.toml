@@ -1,6 +1,6 @@
 [package]
 name = "smtui"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Server manager TUI that runs on your server inside tmux: tabs with a mouse-friendly file browser and a terminal that follows it"
 repository = "https://github.com/hitaloose/smtui"

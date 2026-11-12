@@ -44,6 +44,29 @@ pub fn archive_name(base: &str, taken: &HashSet<String>) -> String {
         .expect("an unused name always exists")
 }
 
+/// `New file.txt`, then `New file (2).txt`… until unused.
+pub fn numbered_file_name(stem: &str, ext: &str, taken: &HashSet<String>) -> String {
+    (1..)
+        .map(|i| if i == 1 { format!("{stem}{ext}") } else { format!("{stem} ({i}){ext}") })
+        .find(|c| !taken.contains(c))
+        .expect("an unused name always exists")
+}
+
+/// Why `name` cannot be a new file or folder in the open one, if it cannot.
+pub fn new_name_problem(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("Type a name.")
+    } else if name.contains('/') {
+        Some("A name cannot contain /.")
+    } else if name == "." || name == ".." {
+        Some("Not a valid name.")
+    } else if name.len() > 255 {
+        Some("Too long.")
+    } else {
+        None
+    }
+}
+
 /// Archive formats smtui can extract. Tarballs go through `tar` (which detects the
 /// compression itself), zip files through `unzip`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +374,20 @@ pub fn format_modified(time: Option<SystemTime>, now: DateTime<Local>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_folder_names() {
+        let taken: HashSet<String> = ["New folder".to_string(), "New folder (2)".to_string()].into();
+        assert_eq!(numbered_name("New folder", &taken), "New folder (3)");
+        assert_eq!(numbered_name("site", &taken), "site");
+        let files: HashSet<String> = ["New file.txt".to_string()].into();
+        assert_eq!(numbered_file_name("New file", ".txt", &files), "New file (2).txt");
+        assert_eq!(new_name_problem("site"), None);
+        assert_eq!(new_name_problem("my notes.txt"), None);
+        assert!(new_name_problem("  ").is_some());
+        assert!(new_name_problem("a/b").is_some());
+        assert!(new_name_problem("..").is_some());
+    }
 
     fn set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()

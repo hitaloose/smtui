@@ -131,6 +131,8 @@ pub trait Pane {
     }
     /// A context menu item was chosen, or a confirmation dialog was accepted.
     fn on_action(&mut self, _action: u32, _ctx: &mut ModeCtx) {}
+    /// A dialog asking for text (see [`crate::ui::dialog::TextInput`]) was accepted.
+    fn on_text(&mut self, _action: u32, _text: &str, _ctx: &mut ModeCtx) {}
 
     /// Status line text while this pane has the focus.
     fn status(&self, shared: &Shared) -> String;

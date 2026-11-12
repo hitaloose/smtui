@@ -54,6 +54,20 @@ impl MemoryFs {
         Self { dirs: Mutex::new(dirs) }
     }
 
+    fn create(&self, path: &Path, kind: EntryKind) -> io::Result<()> {
+        let mut dirs = self.dirs.lock().expect("memory fs lock");
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return Err(not_found(path)) };
+        let list = dirs.get_mut(parent).ok_or_else(|| not_found(parent))?;
+        if list.iter().any(|e| e.name == name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", path.display())));
+        }
+        list.push(Entry { name: name.into(), kind, size: 0, modified: Some(SystemTime::now()), symlink: false });
+        if kind == EntryKind::Dir {
+            dirs.insert(path.to_path_buf(), Vec::new());
+        }
+        Ok(())
+    }
+
     fn transfer(&self, from: &Path, to: &Path, remove_source: bool) -> io::Result<()> {
         let mut dirs = self.dirs.lock().expect("memory fs lock");
         let (Some(src_parent), Some(src_name)) = (from.parent(), from.file_name()) else { return Err(not_found(from)) };
@@ -128,6 +142,14 @@ impl Fs for MemoryFs {
         Ok(folder.into())
     }
 
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        self.create(path, EntryKind::Dir)
+    }
+
+    fn create_file(&self, path: &Path) -> io::Result<()> {
+        self.create(path, EntryKind::File)
+    }
+
     fn remove(&self, path: &Path) -> io::Result<()> {
         let mut dirs = self.dirs.lock().expect("memory fs lock");
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return Err(not_found(path)) };
@@ -155,5 +177,18 @@ mod tests {
         fs.copy_to(Path::new("/srv/apps"), Path::new("/srv/apps (copy)")).unwrap();
         assert_eq!(fs.list(Path::new("/srv/apps (copy)/api")).unwrap().len(), 1);
         assert!(fs.copy_to(Path::new("/srv/apps"), Path::new("/srv/apps")).is_err());
+    }
+
+    #[test]
+    fn creates_folders_once() {
+        let fs = MemoryFs::sample();
+        fs.create_dir(Path::new("/srv/site")).unwrap();
+        assert!(fs.list(Path::new("/srv/site")).unwrap().is_empty());
+        assert!(fs.list(Path::new("/srv")).unwrap().iter().any(|e| e.name == "site" && e.is_dir()));
+        assert!(fs.create_dir(Path::new("/srv/site")).is_err());
+        fs.create_file(Path::new("/srv/notes.txt")).unwrap();
+        assert!(fs.list(Path::new("/srv")).unwrap().iter().any(|e| e.name == "notes.txt" && !e.is_dir()));
+        assert!(fs.create_file(Path::new("/srv/notes.txt")).is_err());
+        assert!(fs.create_file(Path::new("/srv/site")).is_err());
     }
 }

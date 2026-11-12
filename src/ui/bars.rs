@@ -25,6 +25,10 @@ pub enum ChromeTarget {
     /// The `TERMINAL` title: opens a minimized terminal, minimizes an open one.
     TermTitle,
     TermSize(TermSize),
+    /// A terminal tab of the current workspace.
+    Term(usize),
+    CloseTerm(usize),
+    NewTerm,
     /// Opens the menu of leader-key shortcuts.
     Shortcuts,
     Quit,
@@ -33,8 +37,8 @@ pub enum ChromeTarget {
 #[derive(Debug, Clone)]
 pub struct TabInfo {
     pub title: String,
-    /// A program is running in the tab's terminal.
-    pub busy: bool,
+    /// Commands running in the tab's terminals.
+    pub running: usize,
 }
 
 /// `~/apps` for folders under `$HOME`.
@@ -126,7 +130,7 @@ pub fn render_tab_bar(
     let close_w: u16 = if closable { 4 } else { 1 };
 
     let labels: Vec<String> = tabs.iter().map(|t| format!("  {icon}  {}", truncate(&t.title, MAX_TITLE))).collect();
-    let busy_w = |i: usize| if tabs[i].busy { 2 } else { 0 };
+    let busy_w = |i: usize| if tabs[i].running > 0 { 2 + tabs[i].running.to_string().len() as u16 } else { 0 };
     let widths: Vec<u16> = labels.iter().enumerate().map(|(i, l)| l.width() as u16 + busy_w(i) + close_w + 1).collect();
 
     // Drop tabs from the left until the active one fits.
@@ -161,8 +165,8 @@ pub fn render_tab_bar(
             label_style = label_style.add_modifier(Modifier::BOLD);
         }
         let mut spans = vec![Span::styled(label.clone(), label_style)];
-        if tabs[i].busy {
-            spans.push(Span::styled(" ●", Style::new().fg(theme.warn).bg(bg)));
+        if tabs[i].running > 0 {
+            spans.push(Span::styled(format!(" ●{}", tabs[i].running), Style::new().fg(theme.warn).bg(bg)));
         }
         let lw = text_at(f, x, y, spans);
         hits.push(Rect::new(x, area.y, lw, area.height), ChromeTarget::Tab(i));
@@ -184,31 +188,30 @@ pub fn render_tab_bar(
 
 /// What the terminal header shows.
 pub struct TermHeader<'a> {
-    pub dir: &'a Path,
+    pub tabs: &'a [crate::modes::terminal::TermTabInfo],
+    pub active: usize,
     pub focused: bool,
     pub size: TermSize,
-    /// The program in the foreground, if any.
-    pub busy: Option<&'a str>,
-    /// Folder the shell will `cd` into once that program exits.
-    pub pending: Option<&'a Path>,
-    /// False when the Files folder does not exist on disk (the demo), so nothing is followed.
-    pub follows: bool,
 }
 
-/// `▸ TERMINAL  ~/apps  ● follows Files ……… min  half  full`
+const MAX_TERM_LABEL: usize = 28;
+
+/// `▾ TERMINAL │ ⌂ ~/apps │ tail -f app.log ● × │ npm test ✓ × │ + ……… min  half  full`
 pub fn render_term_header(f: &mut Frame, area: Rect, theme: &Theme, h: &TermHeader, hits: &mut HitMap<ChromeTarget>) {
+    use crate::modes::terminal::TermState;
     if area.height == 0 {
         return;
     }
     fill(f, area, Style::new().bg(theme.bar_bg));
     let y = area.y;
     let base = Style::new().bg(theme.bar_bg);
+    let sep = |f: &mut Frame, x: u16| text_at(f, x, y, vec![Span::styled("│", base.fg(theme.border))]);
 
     // Size buttons on the right: the current one is highlighted.
     let buttons = [(TermSize::Min, " min "), (TermSize::Normal, " half "), (TermSize::Full, " full ")];
     let buttons_w: u16 = buttons.iter().map(|(_, l)| l.width() as u16 + 1).sum::<u16>() + 1;
     let mut bx = area.right().saturating_sub(buttons_w);
-    let left_limit = bx.saturating_sub(1);
+    let limit = bx.saturating_sub(1);
     for (size, label) in buttons {
         let style = if size == h.size {
             base.bg(theme.accent_tint).fg(theme.accent).add_modifier(Modifier::BOLD)
@@ -222,27 +225,70 @@ pub fn render_term_header(f: &mut Frame, area: Rect, theme: &Theme, h: &TermHead
 
     let arrow = if h.size == TermSize::Min { "▸" } else { "▾" };
     let title_style = if h.focused { base.fg(theme.accent).add_modifier(Modifier::BOLD) } else { base.fg(theme.fg_muted) };
-    let title = format!(" {arrow} TERMINAL ");
-    let tw = text_at(f, area.x, y, vec![Span::styled(title, title_style)]);
+    let tw = text_at(f, area.x, y, vec![Span::styled(format!(" {arrow} TERMINAL "), title_style)]);
     hits.push(Rect::new(area.x, y, tw, 1), ChromeTarget::TermTitle);
+    let mut x = area.x + tw;
+    x += sep(f, x);
 
-    let mut x = area.x + tw + 1;
-    let room = |x: u16| left_limit.saturating_sub(x) as usize;
-    let dir = truncate_start(&tilde(h.dir), room(x).min(40));
-    if !dir.is_empty() {
-        x += text_at(f, x, y, vec![Span::styled(dir, base.fg(theme.fg_muted))]) + 2;
-    }
-    let (state, color) = match (h.busy, h.pending) {
-        (Some(prog), Some(dir)) => {
-            let name = dir.file_name().map_or_else(|| "/".into(), |n| n.to_string_lossy().into_owned());
-            (format!("● {prog} is running · cd {name} when it exits"), theme.warn)
+    // Terminal tabs: (spans, width) each; `+` after them.
+    let tab_spans = |i: usize| -> Vec<Span<'static>> {
+        let t = &h.tabs[i];
+        let on = i == h.active;
+        let bg = if on { theme.bg } else { theme.bar_bg };
+        let mut label = Style::new().bg(bg).fg(if on { theme.fg } else { theme.fg_muted });
+        if on {
+            label = label.add_modifier(Modifier::BOLD);
         }
-        (Some(prog), None) => (format!("● {prog} is running"), theme.warn),
-        (None, _) if h.follows => ("● follows Files".to_string(), theme.accent),
-        (None, _) => (String::new(), theme.fg_muted),
+        let mut spans = vec![Span::styled(" ", label)];
+        if t.nav {
+            spans.push(Span::styled("⌂ ", Style::new().bg(bg).fg(theme.accent)));
+        }
+        // Folders keep their end (`…/apps/api`), commands their start (`tail -f app…`).
+        let text = if t.nav { truncate_start(&t.label, MAX_TERM_LABEL) } else { truncate(&t.label, MAX_TERM_LABEL) };
+        spans.push(Span::styled(text, label));
+        match t.state {
+            TermState::Running => spans.push(Span::styled(" ●", Style::new().bg(bg).fg(theme.warn))),
+            TermState::Done(Some(0)) => spans.push(Span::styled(" ✓", Style::new().bg(bg).fg(theme.accent))),
+            TermState::Done(Some(code)) => spans.push(Span::styled(format!(" ✗ {code}"), Style::new().bg(bg).fg(theme.danger))),
+            TermState::Done(None) => spans.push(Span::styled(" ■", Style::new().bg(bg).fg(theme.fg_muted))),
+            TermState::Idle => {}
+        }
+        spans.push(Span::styled(" ", label));
+        spans
     };
-    if room(x) > 3 && !state.is_empty() {
-        text_at(f, x, y, vec![Span::styled(truncate(&state, room(x)), base.fg(color))]);
+    let close_w = |i: usize| if h.tabs[i].nav { 0 } else { 2 };
+    let width = |spans: &[Span]| spans.iter().map(|s| s.width() as u16).sum::<u16>();
+    let widths: Vec<u16> = (0..h.tabs.len()).map(|i| width(&tab_spans(i)) + close_w(i) + 1).collect();
+    const PLUS_W: u16 = 4;
+    let room = limit.saturating_sub(x + PLUS_W);
+    // The navigation shell always shows; skip command tabs after it until the active one fits.
+    let mut skip = 0;
+    let shown = |skip: usize| -> u16 {
+        widths[0] + if h.active == 0 { 0 } else { widths[(1 + skip).min(h.active)..=h.active].iter().sum::<u16>() }
+    };
+    while h.active > 0 && 1 + skip < h.active && shown(skip) > room {
+        skip += 1;
+    }
+    let order: Vec<usize> = std::iter::once(0).chain((1 + skip)..h.tabs.len()).collect();
+    for i in order {
+        if x + widths[i] > limit.saturating_sub(PLUS_W) {
+            break;
+        }
+        let spans = tab_spans(i);
+        let w = text_at(f, x, y, spans);
+        hits.push(Rect::new(x, y, w, 1), ChromeTarget::Term(i));
+        x += w;
+        if !h.tabs[i].nav {
+            let bg = if i == h.active { theme.bg } else { theme.bar_bg };
+            text_at(f, x, y, vec![Span::styled("× ", Style::new().bg(bg).fg(theme.fg_muted))]);
+            hits.push(Rect::new(x, y, 2, 1), ChromeTarget::CloseTerm(i));
+            x += 2;
+        }
+        x += sep(f, x);
+    }
+    if x + PLUS_W <= limit {
+        text_at(f, x, y, vec![Span::styled(" + ", base.fg(theme.fg).add_modifier(Modifier::BOLD))]);
+        hits.push(Rect::new(x, y, 3, 1), ChromeTarget::NewTerm);
     }
 }
 

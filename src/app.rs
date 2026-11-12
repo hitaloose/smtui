@@ -23,12 +23,12 @@ use crate::{
         Effect, EventResult, MenuItem, ModeCtx, Pane, Shared,
         files::FilesMode,
         requests::{OpenTab, ShowInFiles},
-        terminal::TerminalMode,
+        terminal::{self, TerminalMode},
     },
     ui::{
         AppLayout, TermSize,
         bars::{self, ChromeTarget, TabInfo, TermHeader},
-        dialog::{DialogHit, DialogState},
+        dialog::{Confirm, DialogHit, DialogState},
         hit::HitMap,
         menu::{MenuOwner, MenuState},
         run_dialog::{RunDialogState, RunHit, RunOutcome},
@@ -46,6 +46,11 @@ mod app_action {
     pub const QUIT: u32 = 5;
     pub const SWAP_FOCUS: u32 = 6;
     pub const CYCLE_SIZE: u32 = 7;
+    pub const NEW_TERM: u32 = 8;
+    pub const NEXT_TERM: u32 = 9;
+    pub const PREV_TERM: u32 = 10;
+    pub const NAV_TERM: u32 = 11;
+    pub const CLOSE_FINISHED: u32 = 12;
     /// `PANE_ACTION_BASE * (pane + 1) + a` runs action `a` of that pane (its shortcut items).
     pub const PANE_ACTION_BASE: u32 = 1_000_000;
 }
@@ -178,9 +183,15 @@ impl App {
                         self.toast = None;
                         dirty = true;
                     }
-                    // Programs starting and exiting in the terminals (and pending `cd`s).
-                    if self.term.poll() {
-                        dirty = true;
+                    // Commands starting and ending, promotions and pending `cd`s.
+                    let (changed, promoted) = self.term.poll();
+                    dirty |= changed;
+                    let active = self.active();
+                    if let Some(p) = promoted.into_iter().find(|p| p.tab == active) {
+                        self.toast = Some(Toast::new(
+                            format!("“{}” is still running, so it keeps its own terminal", bars::truncate(&p.label, 48)),
+                            "A new navigation shell is ready in the first terminal tab.".into(),
+                        ));
                     }
                 }
             }
@@ -222,7 +233,7 @@ impl App {
         self.term.focused = focus == Focus::Term;
 
         let tabs: Vec<TabInfo> = (0..self.files.tab_count())
-            .map(|t| TabInfo { title: self.files.title(t), busy: self.term.busy(t).is_some() })
+            .map(|t| TabInfo { title: self.files.title(t), running: self.term.running(t) })
             .collect();
         bars::render_tab_bar(f, self.layout.tab_bar, theme, "▤", &tabs, i, &mut self.chrome_hits);
 
@@ -232,16 +243,13 @@ impl App {
             }
             self.files.render(f, self.layout.files, &self.shared);
         }
+        let mut term_tabs = self.term.term_tabs(i);
         // The demo's shell runs in a real folder of this machine: show the sample one instead.
-        let dir = if self.shared.demo { self.files.path(i).to_path_buf() } else { self.term.shown_dir(i) };
-        let header = TermHeader {
-            dir: &dir,
-            focused: focus == Focus::Term,
-            size,
-            busy: self.term.busy(i),
-            pending: self.term.pending(i),
-            follows: self.files.path(i).is_dir(),
-        };
+        if self.shared.demo {
+            term_tabs[0].label = bars::tilde(self.files.path(i));
+        }
+        let header =
+            TermHeader { tabs: &term_tabs, active: self.term.active_term(i), focused: focus == Focus::Term, size };
         bars::render_term_header(f, self.layout.term_header, theme, &header, &mut self.chrome_hits);
         if self.layout.term.height > 0 {
             self.term.render(f, self.layout.term, &self.shared);
@@ -253,7 +261,7 @@ impl App {
         };
         if self.leader_pending {
             status = format!(
-                "{}: t new · w close · n/p next/prev · ` focus · z size · ? menu · q quit",
+                "{}: t new tab · c new terminal · j/k terminals · ` focus · z size · ? menu · q quit",
                 crate::keys::display(&self.shared.config.leader)
             );
         }
@@ -380,6 +388,7 @@ impl App {
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right if !dialog.has_input() => {
                     dialog.toggle_focus()
                 }
+                KeyCode::Left | KeyCode::Right | KeyCode::End | KeyCode::Home => dialog.deselect(),
                 KeyCode::Enter => {
                     let confirm = if dialog.has_input() { dialog.can_confirm() } else { dialog.confirm_focused() };
                     if confirm {
@@ -389,6 +398,7 @@ impl App {
                     }
                 }
                 KeyCode::Backspace => dialog.backspace(),
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => dialog.clear_input(),
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => dialog.type_text(&c.to_string()),
                 _ => {}
             }
@@ -445,7 +455,11 @@ impl App {
 
     fn leader_command(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('t') | KeyCode::Char('c') => self.new_tab(),
+            KeyCode::Char('t') => self.new_tab(),
+            KeyCode::Char('c') => self.new_term(),
+            KeyCode::Char('j') | KeyCode::Down => self.cycle_term(1),
+            KeyCode::Char('k') | KeyCode::Up => self.cycle_term(-1),
+            KeyCode::Char('0') => self.select_term(0),
             KeyCode::Char('w') | KeyCode::Char('x') => self.close_tab(self.active()),
             KeyCode::Char('n') | KeyCode::Right => self.cycle_tab(1),
             KeyCode::Char('p') | KeyCode::Left => self.cycle_tab(-1),
@@ -585,6 +599,9 @@ impl App {
                 ws.set_size(size);
             }
             Some(ChromeTarget::TermSize(size)) => self.ws().set_size(size),
+            Some(ChromeTarget::Term(t)) => self.select_term(t),
+            Some(ChromeTarget::CloseTerm(t)) => self.close_term(t),
+            Some(ChromeTarget::NewTerm) => self.new_term(),
             Some(ChromeTarget::Quit) => self.quit = true,
             Some(ChromeTarget::Shortcuts) => self.open_shortcuts_menu(x, y),
             None => {}
@@ -626,6 +643,17 @@ impl App {
             MenuItem::Separator,
             MenuItem::action(swap, app_action::SWAP_FOCUS).with_hint("`"),
             MenuItem::action(format!("Terminal size: {size}"), app_action::CYCLE_SIZE).with_hint(leader_only("z")),
+            MenuItem::Separator,
+            MenuItem::action("New terminal", app_action::NEW_TERM).with_hint(leader_only("c")),
+            MenuItem::action("Next terminal", app_action::NEXT_TERM).with_hint(leader_only("j")),
+            MenuItem::action("Previous terminal", app_action::PREV_TERM).with_hint(leader_only("k")),
+            MenuItem::action("Navigation terminal", app_action::NAV_TERM).with_hint(leader_only("0")),
+            MenuItem::action("Close finished terminals", app_action::CLOSE_FINISHED)
+                .with_hint(match self.term.finished() {
+                    0 => String::new(),
+                    n => n.to_string(),
+                })
+                .enabled(self.term.finished() > 0),
             MenuItem::Separator,
         ];
         let base = app_action::PANE_ACTION_BASE;
@@ -673,14 +701,24 @@ impl App {
             app_action::QUIT => self.quit = true,
             app_action::SWAP_FOCUS => self.swap_focus(),
             app_action::CYCLE_SIZE => self.cycle_size(),
+            app_action::NEW_TERM => self.new_term(),
+            app_action::NEXT_TERM => self.cycle_term(1),
+            app_action::PREV_TERM => self.cycle_term(-1),
+            app_action::NAV_TERM => self.select_term(0),
+            app_action::CLOSE_FINISHED => {
+                let n = self.term.close_finished();
+                let s = if n == 1 { "" } else { "s" };
+                self.toast = Some(Toast::new(format!("Closed {n} finished terminal{s}"), String::new()));
+            }
             a if a >= 2 * base => self.with_pane(Focus::Term, |p, ctx| p.on_action(a - 2 * base, ctx)),
             a if a >= base => self.with_pane(Focus::Files, |p, ctx| p.on_action(a - base, ctx)),
             _ => {}
         }
     }
 
-    /// Enter / Run in the Run dialog: types the command into this tab's terminal, or into a
-    /// new tab in the same folder when a program is running there.
+    /// Enter / Run in the Run dialog: types the command into this tab's navigation shell (a
+    /// long command is then promoted like any other), or into a new terminal tab when the
+    /// navigation shell is still busy.
     fn submit_run(&mut self) {
         let Some(run) = &mut self.run_dialog else { return };
         match run.submit() {
@@ -690,14 +728,11 @@ impl App {
                 let p = run.prompt;
                 self.run_history.record(&p.key, &prefix, &args);
                 let i = self.active();
-                let busy = self.term.busy(i).map(str::to_string);
-                if busy.is_none() && self.term.run_in(i, &command) {
-                    self.ws().set_focus(Focus::Term);
-                    return;
+                let in_new_terminal = self.term.run_in(i, &command);
+                self.ws().set_focus(Focus::Term);
+                if in_new_terminal {
+                    self.toast = Some(Toast::new("The navigation shell is busy, so this runs in a new terminal".into(), command));
                 }
-                let why = busy.unwrap_or_else(|| "the shell exited".into());
-                self.open_tab(p.cwd, Some(command.clone()));
-                self.toast = Some(Toast::new(format!("Terminal busy ({why}), opened a new tab"), command));
             }
         }
     }
@@ -705,7 +740,11 @@ impl App {
     fn accept_dialog(&mut self) {
         if let Some(d) = self.dialog.take() {
             let action = d.confirm.action;
-            self.with_pane(Focus::from_index(d.mode), |p, ctx| p.on_action(action, ctx));
+            let pane = Focus::from_index(d.mode);
+            match d.text().map(str::to_string) {
+                Some(text) => self.with_pane(pane, |p, ctx| p.on_text(action, &text, ctx)),
+                None => self.with_pane(pane, |p, ctx| p.on_action(action, ctx)),
+            }
         }
     }
 
@@ -715,7 +754,7 @@ impl App {
     fn open_tab(&mut self, cwd: PathBuf, typed: Option<String>) {
         let focus = if typed.is_some() { Focus::Term } else { Focus::Files };
         // The shell starts in `cwd` when it exists on disk (not in the demo file system).
-        let shell_dir = if cwd.is_dir() { cwd.clone() } else { self.term.shown_dir(self.active()) };
+        let shell_dir = if cwd.is_dir() { cwd.clone() } else { self.term.nav_dir(self.active()) };
         self.files.open_tab(cwd.clone());
         self.term.open_tab(shell_dir, typed);
         self.workspaces.push(Workspace::new(cwd, focus));
@@ -749,6 +788,45 @@ impl App {
             let next = (self.active() as i32 + delta).rem_euclid(n);
             self.select_tab(next as usize);
         }
+    }
+
+    fn new_term(&mut self) {
+        self.term.new_term();
+        self.ws().set_focus(Focus::Term);
+    }
+
+    fn select_term(&mut self, t: usize) {
+        self.term.select_term(t);
+        self.ws().set_focus(Focus::Term);
+    }
+
+    fn cycle_term(&mut self, delta: i32) {
+        self.term.cycle_term(delta);
+        self.ws().set_focus(Focus::Term);
+    }
+
+    /// Closes a terminal tab; one still running a command asks first.
+    fn close_term(&mut self, t: usize) {
+        if !self.term.is_running(t) {
+            self.term.close_term(t);
+            return;
+        }
+        let label = self.term.label(t);
+        self.term.ask_close(t);
+        self.menu = None;
+        self.dialog = Some(DialogState::new(
+            Focus::Term as usize,
+            Confirm {
+                title: format!("Stop {}?", bars::truncate(&label, 40)),
+                message: "It is still running. Closing its terminal stops it.".into(),
+                items: Vec::new(),
+                confirm_label: "Stop and close".into(),
+                danger: true,
+                require_text: None,
+                text: None,
+                action: terminal::CLOSE_CONFIRMED,
+            },
+        ));
     }
 
     fn swap_focus(&mut self) {

@@ -24,7 +24,13 @@ use self::{
     view::FilesTarget,
 };
 use super::{EventResult, MenuItem, ModeCtx, Pane, Shared, requests::OpenTab};
-use crate::{clipboard, event::AppEvent, event::EventSender, ui::dialog::Confirm, ui::hit::HitMap};
+use crate::{
+    clipboard,
+    event::AppEvent,
+    event::EventSender,
+    ui::dialog::{Confirm, TextInput},
+    ui::hit::HitMap,
+};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
@@ -44,6 +50,10 @@ mod action {
     pub const REFRESH: u32 = 13;
     pub const RUN: u32 = 14;
     pub const EXTRACT: u32 = 15;
+    pub const NEW_FOLDER: u32 = 16;
+    pub const NEW_FOLDER_NAMED: u32 = 17;
+    pub const NEW_FILE: u32 = 18;
+    pub const NEW_FILE_NAMED: u32 = 19;
 }
 
 enum FilesEvent {
@@ -52,6 +62,7 @@ enum FilesEvent {
     Deleted(DeleteReport),
     Compressed { tab_id: u64, dir: PathBuf, result: Result<OsString, String> },
     Extracted { tab_id: u64, dir: PathBuf, created: Vec<OsString>, errors: Vec<String> },
+    Created { tab_id: u64, dir: PathBuf, name: OsString, folder: bool, result: Result<(), String> },
 }
 
 #[derive(Clone)]
@@ -418,6 +429,7 @@ impl FilesMode {
             confirm_label: "Delete".into(),
             danger: true,
             require_text: Some("DELETE".into()),
+            text: None,
             action: action::DELETE_CONFIRMED,
         });
         self.pending_delete = Some((tab.path.clone(), targets));
@@ -638,6 +650,60 @@ impl FilesMode {
         ctx.toast(msg, cmd);
     }
 
+    // ---- New folder / new file ----
+
+    /// Asks for the name of a new folder (or file) in the open one.
+    fn ask_new(&mut self, folder: bool, ctx: &mut ModeCtx) {
+        let tab = &self.tabs[self.active];
+        let taken: HashSet<String> = tab.entries.iter().map(|e| e.name.to_string_lossy().into_owned()).collect();
+        let (title, suggestion, action) = if folder {
+            ("New folder", ops::numbered_name("New folder", &taken), action::NEW_FOLDER_NAMED)
+        } else {
+            ("New file", ops::numbered_file_name("New file", ".txt", &taken), action::NEW_FILE_NAMED)
+        };
+        let what = if folder { "a folder" } else { "an empty file" };
+        ctx.confirm(Confirm {
+            title: title.into(),
+            message: format!("Create {what} in {}.", tab.path.display()),
+            items: Vec::new(),
+            confirm_label: "Create".into(),
+            danger: false,
+            require_text: None,
+            text: Some(TextInput {
+                label: if folder { "Name:".into() } else { "Name and extension:".into() },
+                initial: suggestion,
+                validate: ops::new_name_problem,
+            }),
+            action,
+        });
+    }
+
+    fn create(&mut self, name: &str, folder: bool) {
+        let tab = &self.tabs[self.active];
+        let (fs, tx, dir, tab_id, name) = (self.fs.clone(), self.tx.clone(), tab.path.clone(), tab.id, OsString::from(name));
+        std::thread::spawn(move || {
+            let path = dir.join(&name);
+            let result = if folder { fs.create_dir(&path) } else { fs.create_file(&path) };
+            let result = result.map_err(|e| e.to_string());
+            tx.send(FilesEvent::Created { tab_id, dir, name, folder, result });
+        });
+    }
+
+    fn finish_create(&mut self, tab_id: u64, dir: &PathBuf, name: &OsString, folder: bool, result: &Result<(), String>, ctx: &mut ModeCtx) {
+        let shown = format!("{}{}", name.to_string_lossy(), if folder { "/" } else { "" });
+        match result {
+            Ok(()) => {
+                for tab in self.tabs.iter_mut().filter(|t| t.id == tab_id && &t.path == dir) {
+                    tab.select_after_load = Some(BTreeSet::from([name.clone()]));
+                }
+                ctx.toast(format!("Created {shown}"), "");
+            }
+            Err(e) => ctx.toast(format!("Could not create {shown}"), e.clone()),
+        }
+        let dir = dir.clone();
+        self.reload_where(|t| t.path == dir);
+    }
+
     fn toggle_hidden(&mut self, ctx: &mut ModeCtx) {
         self.show_hidden = !self.show_hidden;
         let value = self.show_hidden;
@@ -664,15 +730,21 @@ impl FilesMode {
 
         let mut items = Vec::new();
         self.menu_into = None;
+        let new_folder = MenuItem::action("New folder", action::NEW_FOLDER).with_hint("n");
+        let new_file = MenuItem::action("New file", action::NEW_FILE).with_hint("f");
         if on_item && n > 0 {
             // First, but harmless on a stray Enter: it only opens the dialog, which needs its own Enter.
             items.push(MenuItem::action(format!("Run…{suffix}"), action::RUN).with_hint("!"));
             items.push(MenuItem::Separator);
-            if single_dir.is_some() {
-                items.push(MenuItem::action("Open", action::OPEN));
-            }
-            items.push(MenuItem::action(format!("Copy{suffix}"), action::COPY));
-            items.push(MenuItem::action(format!("Move{suffix}"), action::MOVE));
+            items.push(new_folder);
+            items.push(new_file);
+            items.push(match &single_dir {
+                Some(_) => MenuItem::action("Open in new tab", action::TERMINAL).with_hint("t"),
+                None => MenuItem::action("New tab here", action::TERMINAL).with_hint("t"),
+            });
+            items.push(MenuItem::Separator);
+            items.push(MenuItem::action(format!("Copy{suffix}"), action::COPY).with_hint("c"));
+            items.push(MenuItem::action(format!("Move{suffix}"), action::MOVE).with_hint("m"));
             let paste = match &single_dir {
                 Some(dir) => {
                     self.menu_into = Some(dir.clone());
@@ -683,32 +755,31 @@ impl FilesMode {
             items.push(paste.with_hint(paste_hint).enabled(can_paste));
             items.push(MenuItem::Separator);
             let archives = all_archives(&selected);
-            if archives {
-                let label = if n > 1 { format!("Extract {n} archives here") } else { "Extract here".to_string() };
-                items.push(MenuItem::action(label, action::EXTRACT).with_hint("e").enabled(!self.extracting));
-            }
             // Compressing an archive again only wraps it: disabled, Extract is the useful action.
             items.push(
                 MenuItem::action("Compress to .tar.gz", action::COMPRESS).with_hint("z").enabled(!self.compressing && !archives),
             );
-            items.push(MenuItem::action("Copy scp command", action::SCP));
+            // Always listed so the menu keeps its shape; disabled when it does not apply.
+            let extract = if n > 1 && archives { format!("Extract {n} archives here") } else { "Extract here".to_string() };
+            items.push(MenuItem::action(extract, action::EXTRACT).with_hint("e").enabled(archives && !self.extracting));
+            items.push(MenuItem::Separator);
+            items.push(MenuItem::action("Copy scp command", action::SCP).with_hint("s"));
             items.push(MenuItem::action(
                 if single_dir.is_some() { "Copy upload command" } else { "Copy upload command here" },
                 action::UPLOAD,
             ).with_hint("u"));
-            items.push(match &single_dir {
-                Some(_) => MenuItem::action("Open in new tab", action::TERMINAL).with_hint("t"),
-                None => MenuItem::action("New tab here", action::TERMINAL).with_hint("t"),
-            });
             items.push(MenuItem::Separator);
             items.push(
                 MenuItem::action(format!("Delete{suffix}"), action::DELETE).with_hint("Del").danger().enabled(!self.deleting),
             );
         } else {
+            items.push(new_folder);
+            items.push(new_file);
+            items.push(MenuItem::action("New tab here", action::TERMINAL).with_hint("t"));
+            items.push(MenuItem::Separator);
             items.push(MenuItem::action("Paste here", action::PASTE_HERE).with_hint(paste_hint).enabled(can_paste));
             items.push(MenuItem::Separator);
             items.push(MenuItem::action("Copy upload command here", action::UPLOAD).with_hint("u"));
-            items.push(MenuItem::action("New tab here", action::TERMINAL).with_hint("t"));
         }
         self.menu_folder = Some(match (&single_dir, on_item) {
             (Some(dir), true) => dir.clone(),
@@ -861,6 +932,8 @@ impl Pane for FilesMode {
                 ctx.request(OpenTab { cwd });
             }
             KeyCode::Char('.') => self.toggle_hidden(ctx),
+            KeyCode::Char('n') if !ctrl => self.ask_new(true, ctx),
+            KeyCode::Char('f') if !ctrl => self.ask_new(false, ctx),
             KeyCode::Char('!') => {
                 self.ensure_selection();
                 self.ask_run(ctx);
@@ -956,6 +1029,9 @@ impl Pane for FilesMode {
             FilesEvent::Deleted(report) => self.finish_delete(report.clone(), ctx),
             FilesEvent::Compressed { tab_id, dir, result } => self.finish_compress(*tab_id, dir, result, ctx),
             FilesEvent::Extracted { tab_id, dir, created, errors } => self.finish_extract(*tab_id, dir, created, errors, ctx),
+            FilesEvent::Created { tab_id, dir, name, folder, result } => {
+                self.finish_create(*tab_id, dir, name, *folder, result, ctx)
+            }
             FilesEvent::Pasted(report) => {
                 self.finish_paste(report.clone(), ctx);
             }
@@ -993,11 +1069,21 @@ impl Pane for FilesMode {
                 self.copy_upload(&[ops::LOCAL_PATH_PLACEHOLDER.to_string()], dest, false, ctx);
             }
             action::DELETE_CONFIRMED => self.delete(),
+            action::NEW_FOLDER => self.ask_new(true, ctx),
+            action::NEW_FILE => self.ask_new(false, ctx),
             action::TERMINAL => {
                 if let Some(cwd) = self.menu_folder.clone() {
                     ctx.request(OpenTab { cwd });
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn on_text(&mut self, action: u32, text: &str, _ctx: &mut ModeCtx) {
+        match action {
+            action::NEW_FOLDER_NAMED => self.create(text, true),
+            action::NEW_FILE_NAMED => self.create(text, false),
             _ => {}
         }
     }

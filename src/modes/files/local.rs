@@ -57,6 +57,14 @@ impl Fs for LocalFs {
         Self::remove_impl(path)
     }
 
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        std::fs::create_dir(path)
+    }
+
+    fn create_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::OpenOptions::new().write(true).create_new(true).open(path).map(drop)
+    }
+
     fn compress(&self, dir: &Path, names: &[std::ffi::OsString], dest: &Path) -> io::Result<()> {
         ensure_absent(dest)?;
         // No shell; `./name` keeps names starting with `-` from being read as options.

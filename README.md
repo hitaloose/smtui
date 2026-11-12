@@ -7,9 +7,10 @@ workspace, like an editor window:
 
 - **Files** on top: a file browser with multi-selection, two-step copy/move/paste, "Run…" to
   run a command on a file, and a "Copy scp command" action for downloading files to your machine.
-- **Terminal** below: a real local shell (`$SHELL -l`, through a PTY plus a VT100 emulator) that
-  **follows the Files folder**. It can be minimized to its header row, take half of the screen,
-  or cover Files (full screen).
+- **Terminal** below: real local shells (`$SHELL -l`, through a PTY plus a VT100 emulator) in
+  terminal tabs. The first one, the navigation shell, **follows the Files folder**; long commands
+  get a terminal tab of their own. The terminal can be minimized to its header row, take half of
+  the screen, or cover Files (full screen).
 
 The usual workflow:
 
@@ -72,22 +73,37 @@ To send right clicks to smtui, enable *Settings › Pointer › Right-click repo
 
 ## The terminal follows Files
 
-When the folder in Files changes (you open a folder, go up, or the folder is moved or deleted),
-smtui types ` cd <folder>` into the tab's shell. The leading space keeps it out of the history
-with `HISTCONTROL=ignorespace` (bash, the Ubuntu default) or `setopt HIST_IGNORE_SPACE` (zsh).
-Anything you had typed at the prompt without pressing Enter is cleared first.
+The first terminal tab (`⌂ ~/apps`) is the navigation shell. When the folder in Files changes
+(you open a folder, go up, or the folder is moved or deleted), smtui types ` cd <folder>` into
+it. The leading space keeps it out of the history with `HISTCONTROL=ignorespace` (bash, the
+Ubuntu default) or `setopt HIST_IGNORE_SPACE` (zsh). Anything you had typed at the prompt without
+pressing Enter is cleared first. It is one way: `cd` in the shell does not move Files
+("Show shell folder in Files" brings Files there).
 
-It only does this while the shell is at its prompt. When a program is running (vim, `tail -f`,
-a nested shell, ssh…), nothing is typed into it: the header shows
-`● tail is running · cd logs when it exits`, the tab gets a `●`, and the `cd` happens once the
-program exits. It is one way: `cd` in the shell does not move Files (the header shows where the
-shell is; "Show shell folder in Files" brings Files there).
+## Long commands get their own terminal
+
+Commands run where you type them. One that is still running after a second in the navigation
+shell (`tail -f`, `npm run dev`, a build), or that takes the whole screen (vim, less, htop), is
+**promoted**: that terminal becomes a tab named after the command and a fresh navigation shell
+opens first, in the Files folder. The process never moves, so nothing breaks, and the focus stays
+on the command (you may be typing a password, or using vim).
+
+Terminal tabs show `●` while running, then `✓` or `✗ <exit code>` (`■` when the shell does not
+report exit codes: smtui sets bash's `PROMPT_COMMAND` for that, unless your `~/.bashrc` replaces
+it). A finished tab keeps its output and is a normal shell again; close it with `×`, or all of
+them with "Close finished terminals" in the Shortcuts menu. Closing a tab whose command is still
+running asks first. `+` (or `Ctrl+]` then `c`) opens a plain shell tab. The workspace tab shows
+how many commands are running (`apps ●2`).
+
+The new navigation shell does not inherit what you changed in the old one: exported variables,
+aliases, an activated virtualenv.
 
 ## Keys
 
 The mouse works everywhere: click tabs, `×` closes a tab, `+` opens one, click a pane to type
-in it, the terminal header's `min` / `half` / `full` resize it (click `TERMINAL` to minimize or
-open it), **Shortcuts** and **Quit** are at the bottom right, right click opens the context menu.
+in it. The terminal header has the terminal tabs (click to switch, `×` to close, `+` for a new
+shell) and `min` / `half` / `full` to resize it (click `TERMINAL` to minimize or open it).
+**Shortcuts** and **Quit** are at the bottom right, right click opens the context menu.
 
 `Ctrl+Q` is reserved for quitting, so it never reaches programs in the terminal (it is the
 XON flow-control key in most shells and rarely used).
@@ -102,6 +118,9 @@ default `Ctrl+]`, because every other key goes to the shell):
 | `Ctrl+]` then `n` / `p` | Next / previous tab |
 | `` ` `` in Files, `Ctrl+]` then `` ` `` in the terminal | Switch the focus between Files and the terminal |
 | `Ctrl+]` then `z` | Terminal size: minimized → half → full screen |
+| `Ctrl+]` then `c` | New terminal tab (a plain shell) |
+| `Ctrl+]` then `j` / `k` | Next / previous terminal tab |
+| `Ctrl+]` then `0` | The navigation shell |
 | `Ctrl+]` then `?` (or `?` in Files), the **Shortcuts** button | Shortcuts menu (also: hidden files, refresh) |
 | `Ctrl+]` then `f`, or right click in a shell | Show the shell's current folder in Files |
 | `Ctrl+Q` (anywhere), `Ctrl+]` then `q`, or the **Quit** button | Quit |
@@ -125,13 +144,14 @@ Full screen gives the keys to the terminal; minimizing gives them to Files.
 | `Backspace`, `←` | Up one level |
 | `Ctrl+A` / `Esc` | Select all / clear selection |
 | Right click, `o`, `Menu`, `Shift+F10` | Context menu |
+| `n` / `f` | New folder / new empty file (asks for the name; type over the suggestion, `←`/`→` to edit it instead) |
 | `c` / `m` | Copy / Move (mark the items, then Paste in the destination) |
 | `v` | Paste here |
 | `s` | Copy scp command |
 | Drop files on the window | Copy an `scp` command that uploads them into the open folder (or the selected one) |
 | `u` | Copy an upload command with a `<LOCAL_PATH>` placeholder |
 | `z` | Compress the selection to `name.tar.gz` (never overwrites: `name (2).tar.gz`…); disabled for archives |
-| `e` | Extract the selected archives (`.tar.gz` `.tgz` `.tar.bz2` `.tar.xz` `.tar.zst` `.tar` `.zip`) next to them |
+| `e` | Extract the selected archives (`.tar.gz` `.tgz` `.tar.bz2` `.tar.xz` `.tar.zst` `.tar` `.zip`) next to them (listed but disabled in the context menu for other files) |
 | `t` | Open a new tab in the selected folder (or the current one) |
 | `!` | Run… a command on the selection in the terminal below (see below) |
 | `.` | Toggle hidden files (also in the Shortcuts menu, `Ctrl+]` then `.` from the terminal) |
@@ -147,9 +167,10 @@ a local terminal. "Copy upload command" in the context menu (or `u`) does the sa
 
 **Run…** (`!` or the context menu) opens a dialog with three lines: the command (`vim`,
 `less +F`, `python3`…), the selected path (always quoted, never editable) and extra arguments.
-It shows the exact command line before running it, then types it into the tab's terminal (opening
-it if minimized), so it is in your shell history and `Ctrl+C` works. If a program is already
-running there, the command goes to a new tab in the same folder instead. Suggestions depend on the file
+It shows the exact command line before running it, then types it into the navigation shell
+(opening the terminal if minimized), so it is in your shell history and `Ctrl+C` works; a long
+or full-screen command is promoted to its own terminal tab like any other. If the navigation
+shell is still busy, the command runs in a new terminal tab instead. Suggestions depend on the file
 type, and `↑`/`↓` bring back what you ran last for that type (stored in
 `~/.local/state/smtui/run_history.tsv`, readable only by you). Commands that look destructive
 (`rm`, `dd`, `mkfs`, `> file`…) need a second Enter; the dialog also warns when smtui runs as
@@ -201,8 +222,9 @@ The GIF above is recorded with [VHS](https://github.com/charmbracelet/vhs) from 
 `cargo build --release && vhs docs/demo.tape`.
 
 Each tab is a workspace of two panes, which implement the `Pane` trait in `src/modes/mod.rs`:
-`FilesMode` and `TerminalMode` keep one entry per tab, aligned by index, and `src/app.rs` keeps
-them in step and owns the terminal size, the focus and the folder-following.
+`FilesMode` and `TerminalMode` keep one entry per tab, aligned by index (for the terminal, a group
+of terminal tabs whose first one is the navigation shell), and `src/app.rs` keeps them in step and
+owns the terminal size, the focus and the folder-following.
 
 ## License
 

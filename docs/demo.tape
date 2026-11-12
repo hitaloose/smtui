@@ -49,7 +49,7 @@ Space
 Sleep 800ms
 Type "o"
 Sleep 1.2s
-Down
+Down 4
 Sleep 500ms
 Enter
 Sleep 1.5s

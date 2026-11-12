@@ -25,12 +25,20 @@ pub enum TermEvent {
     Clipboard(String),
 }
 
-/// Answers the terminal queries vt100 does not handle and collects OSC 52 requests.
+/// Answers the terminal queries vt100 does not handle, collects OSC 52 requests and reads
+/// the exit codes the shell reports (OSC 133;D, see [`PROMPT_HOOK`]).
 #[derive(Default)]
 pub struct TermCallbacks {
     replies: Vec<u8>,
     clipboard: Vec<Vec<u8>>,
+    /// How many exit codes were reported so far, and the last one.
+    exits: u64,
+    last_exit: i32,
 }
+
+/// Run by bash before each prompt (`PROMPT_COMMAND`): reports `$?` as OSC 133;D, the
+/// sequence VS Code and other terminals use, and keeps `$?` for the user's own prompt.
+const PROMPT_HOOK: &str = r#"__smtui_s=$?; printf '\033]133;D;%s\007' "$__smtui_s"; (exit $__smtui_s)"#;
 
 impl vt100::Callbacks for TermCallbacks {
     fn unhandled_csi(
@@ -57,6 +65,16 @@ impl vt100::Callbacks for TermCallbacks {
 
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
         self.clipboard.push(data.to_vec());
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if let [b"133", kind, rest @ ..] = params
+            && kind.first() == Some(&b'D')
+        {
+            let code = rest.first().and_then(|c| std::str::from_utf8(c).ok()).and_then(|c| c.parse().ok());
+            self.exits += 1;
+            self.last_exit = code.unwrap_or(0);
+        }
     }
 }
 
@@ -90,6 +108,15 @@ impl TerminalSession {
         cmd.arg("-l");
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
+        if shell.rsplit('/').next() == Some("bash") {
+            // Keeps a PROMPT_COMMAND the user exported; one set in ~/.bashrc replaces ours,
+            // which only costs the exit codes on finished terminal tabs.
+            let hook = match std::env::var("PROMPT_COMMAND") {
+                Ok(theirs) if !theirs.trim().is_empty() => format!("{PROMPT_HOOK}; {theirs}"),
+                _ => PROMPT_HOOK.to_string(),
+            };
+            cmd.env("PROMPT_COMMAND", hook);
+        }
         let child = pair.slave.spawn_command(cmd).with_context(|| format!("failed to start {shell}"))?;
         drop(pair.slave);
 
@@ -179,6 +206,18 @@ impl TerminalSession {
         Some(self.master.process_group_leader().and_then(|p| u32::try_from(p).ok()).unwrap_or(0))
     }
 
+    /// `(count, last)` of the exit codes the shell reported (bash only).
+    pub fn exits(&self) -> (u64, i32) {
+        let p = self.screen();
+        let cb = p.callbacks();
+        (cb.exits, cb.last_exit)
+    }
+
+    /// A full-screen program (vim, less, htop) is drawing.
+    pub fn alternate_screen(&self) -> bool {
+        self.screen().screen().alternate_screen()
+    }
+
     /// The shell's own folder, only where that is cheap to read (`/proc` on Linux).
     pub fn shell_cwd(&self) -> Option<PathBuf> {
         let pid = self.child.process_id()?;
@@ -231,22 +270,21 @@ impl Drop for TerminalSession {
     }
 }
 
-/// Name of process `pid`: `/proc` on Linux, `ps` elsewhere.
-pub fn process_name(pid: u32) -> Option<String> {
-    let name = match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        Ok(name) => name,
+/// Command line of process `pid` (`tail -f app.log`): `/proc` on Linux, `ps` elsewhere.
+pub fn process_cmdline(pid: u32) -> Option<String> {
+    let line = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) => raw.split(|b| *b == 0).filter(|a| !a.is_empty()).map(String::from_utf8_lossy).collect::<Vec<_>>().join(" "),
         Err(_) => {
             let out = std::process::Command::new("ps")
-                .args(["-o", "comm=", "-p", &pid.to_string()])
+                .args(["-o", "command=", "-p", &pid.to_string()])
                 .stderr(std::process::Stdio::null())
                 .output()
                 .ok()?;
-            String::from_utf8_lossy(&out.stdout).into_owned()
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
     };
-    // `ps` may print a full path (macOS).
-    let name = name.trim().rsplit('/').next().unwrap_or("").to_string();
-    (!name.is_empty()).then_some(name)
+    let line: String = line.chars().filter(|c| !c.is_control()).collect();
+    (!line.trim().is_empty()).then(|| line.trim().to_string())
 }
 
 /// Current folder of process `pid`: `/proc` on Linux, `lsof` elsewhere (macOS, for development).
@@ -260,4 +298,20 @@ fn process_cwd(pid: u32) -> Option<PathBuf> {
         .output()
         .ok()?;
     String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix('n')).map(PathBuf::from).filter(|p| p.is_dir())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_exit_codes_reported_by_the_prompt_hook() {
+        let mut p = Parser::new_with_callbacks(5, 40, 0, TermCallbacks::default());
+        p.process(b"ls\r\n\x1b]133;D;0\x07$ false\r\n\x1b]133;D;1\x1b\\$ ");
+        let cb = p.callbacks();
+        assert_eq!((cb.exits, cb.last_exit), (2, 1));
+        // Other OSC sequences (window titles) are ignored.
+        p.process(b"\x1b]0;title\x07");
+        assert_eq!(p.callbacks().exits, 2);
+    }
 }
