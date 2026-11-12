@@ -213,21 +213,6 @@ pub fn looks_destructive(cmd: &str) -> bool {
     false
 }
 
-/// Label for the terminal tab: `vim notes.txt`.
-pub fn tab_label(prefix: &str, paths: &[PathBuf]) -> String {
-    let name = match paths {
-        [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into()),
-        many => format!("{} files", many.len()),
-    };
-    let program = prefix.split_whitespace().next().unwrap_or("");
-    let label = if program.is_empty() { name } else { format!("{program} {name}") };
-    let mut out: String = label.chars().take(24).collect();
-    if label.chars().count() > 24 {
-        out.push('…');
-    }
-    out
-}
-
 /// Past runs, one `key<TAB>command<TAB>args` line each, newest last.
 #[derive(Debug, Default)]
 pub struct History {
@@ -368,12 +353,5 @@ mod tests {
         );
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-    }
-
-    #[test]
-    fn labels() {
-        assert_eq!(tab_label("less +F", &[PathBuf::from("/var/log/app.log")]), "less app.log");
-        assert_eq!(tab_label("", &[PathBuf::from("/srv/deploy")]), "deploy");
-        assert_eq!(tab_label("cat", &[PathBuf::from("/a"), PathBuf::from("/b")]), "cat 2 files");
     }
 }

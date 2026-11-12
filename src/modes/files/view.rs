@@ -21,6 +21,8 @@ pub enum FilesTarget {
     Refresh,
     Crumb(PathBuf),
     Row(usize),
+    /// The scrollbar column; click or drag to scroll.
+    Scrollbar,
 }
 
 const SIZE_W: u16 = 9;
@@ -133,11 +135,17 @@ pub fn render_list(
     theme: &Theme,
     tab: &mut FilesTab,
     clip: Option<&Clip>,
+    focused: bool,
     hits: &mut HitMap<FilesTarget>,
 ) -> Rect {
     if area.height == 0 {
         return area;
     }
+    // One column on the right for the scrollbar, only when the folder does not fit.
+    let body_h = area.height.saturating_sub(1) as usize;
+    let scrollable = tab.entries.len() > body_h && area.width > 20;
+    let full = area;
+    let area = if scrollable { Rect { width: area.width - 1, ..area } } else { area };
     let name_w = area.width.saturating_sub(PAD * 2 + SIZE_W + MODIFIED_W + GAP * 2) as usize;
     let header = Rect::new(area.x, area.y, area.width, 1);
     let line = format!(
@@ -157,6 +165,13 @@ pub fn render_list(
 
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
     tab.ensure_cursor_visible(body.height as usize);
+    if scrollable {
+        let bar = Rect::new(full.right() - 1, body.y, 1, body.height);
+        render_scrollbar(f, bar, theme, tab.scroll, body.height as usize, tab.entries.len(), focused);
+        hits.push(bar, FilesTarget::Scrollbar);
+    }
+    // The returned body keeps the scrollbar column, so wheel events over it scroll too.
+    let list_body = Rect { width: full.width, ..body };
 
     let notice = if let Some(err) = &tab.error {
         Some(err.clone())
@@ -171,7 +186,7 @@ pub fn render_list(
             Paragraph::new(Span::styled(text, Style::new().fg(theme.fg_muted))).alignment(ratatui::layout::Alignment::Center),
             rect,
         );
-        return body;
+        return list_body;
     }
 
     let now = Local::now();
@@ -179,7 +194,7 @@ pub fn render_list(
         let e = &tab.entries[idx];
         let rect = Rect::new(body.x, body.y + row as u16, body.width, 1);
         let selected = tab.selection.contains(&e.name);
-        let cursor = idx == tab.cursor;
+        let cursor = focused && idx == tab.cursor;
         let marked = clip.is_some_and(|c| c.op == ops::ClipOp::Move && c.contains(&tab.path, &e.name));
 
         let bg = if selected { theme.accent_tint } else if cursor { theme.raised_bg } else { theme.bg };
@@ -217,5 +232,66 @@ pub fn render_list(
         f.render_widget(Paragraph::new(Line::from(spans)).style(base), rect);
         hits.push(rect, FilesTarget::Row(idx));
     }
-    body
+    list_body
+}
+
+/// Position and length of the thumb in a track of `height` rows: `(top, len)`.
+pub fn thumb(scroll: usize, height: usize, total: usize) -> (usize, usize) {
+    if total <= height || height == 0 {
+        return (0, height);
+    }
+    let len = (height * height / total).clamp(1, height);
+    let max_scroll = total - height;
+    let top = (scroll.min(max_scroll) * (height - len) + max_scroll / 2) / max_scroll;
+    (top, len)
+}
+
+/// The scroll offset that centers the list on row `row` of the track.
+pub fn scroll_for_row(row: usize, height: usize, total: usize) -> usize {
+    if total <= height || height == 0 {
+        return 0;
+    }
+    let point = (row * total + total / 2) / height;
+    point.saturating_sub(height / 2).min(total - height)
+}
+
+fn render_scrollbar(f: &mut Frame, bar: Rect, theme: &Theme, scroll: usize, height: usize, total: usize, focused: bool) {
+    let (top, len) = thumb(scroll, height, total);
+    let thumb_bg = if focused { theme.fg_disabled } else { theme.border };
+    for row in 0..bar.height as usize {
+        let on = row >= top && row < top + len;
+        let style = Style::new().bg(if on { thumb_bg } else { theme.raised_bg });
+        f.render_widget(Paragraph::new(" ").style(style), Rect::new(bar.x, bar.y + row as u16, 1, 1));
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+
+    #[test]
+    fn thumb_covers_the_track_when_everything_fits() {
+        assert_eq!(thumb(0, 10, 5), (0, 10));
+        assert_eq!(thumb(0, 10, 10), (0, 10));
+    }
+
+    #[test]
+    fn thumb_moves_from_top_to_bottom() {
+        // 100 entries in 10 rows: a one-row thumb.
+        assert_eq!(thumb(0, 10, 100), (0, 1));
+        assert_eq!(thumb(90, 10, 100), (9, 1));
+        let (top, len) = thumb(45, 10, 100);
+        assert_eq!(len, 1);
+        assert!((4..=5).contains(&top));
+        // Scrolled past the end (stale value) still stays in the track.
+        assert_eq!(thumb(500, 10, 100), (9, 1));
+    }
+
+    #[test]
+    fn clicking_the_track_jumps_there() {
+        assert_eq!(scroll_for_row(0, 10, 100), 0);
+        assert_eq!(scroll_for_row(9, 10, 100), 90);
+        assert_eq!(scroll_for_row(5, 10, 100), 50);
+        assert_eq!(scroll_for_row(3, 10, 8), 0);
+    }
 }

@@ -1,6 +1,5 @@
-//! The `Mode` trait. The tab bar and the bottom bar are generated from the list of
-//! registered modes, so a new mode (processes, docker, logs…) only has to implement
-//! this trait and be registered in `App::new`.
+//! The two panes of a workspace tab: Files (top) and Terminal (bottom). Each pane keeps one
+//! entry per tab, aligned by index; the app keeps them in step (see `App::new_tab`).
 
 pub mod files;
 pub mod requests;
@@ -13,54 +12,6 @@ use ratatui::{Frame, layout::Rect};
 
 use crate::ui::dialog::Confirm;
 use crate::{config::Config, event::AppEvent, event::EventSender, host::HostInfo, ui::theme::Theme};
-
-#[derive(Debug, Clone)]
-pub struct TabInfo {
-    pub title: String,
-}
-
-/// A shortcut shown in the bottom bar: the key is drawn as a keycap, then the label and,
-/// for toggles, `● on` / `○ off`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyHint {
-    pub key: String,
-    pub label: String,
-    pub state: Option<bool>,
-    pub target: HintTarget,
-}
-
-/// What clicking a hint does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HintTarget {
-    None,
-    /// Runs this action through [`Mode::on_action`].
-    Action(u32),
-    /// Opens the app's menu of leader-key shortcuts.
-    Shortcuts,
-}
-
-impl KeyHint {
-    pub fn new(key: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { key: key.into(), label: label.into(), state: None, target: HintTarget::None }
-    }
-
-    #[allow(dead_code)] // API for modes; no current hint is a toggle
-    pub fn toggle(mut self, on: bool) -> Self {
-        self.state = Some(on);
-        self
-    }
-
-    #[allow(dead_code)] // API for modes; no current hint runs a mode action
-    pub fn on_click(mut self, action: u32) -> Self {
-        self.target = HintTarget::Action(action);
-        self
-    }
-
-    pub fn opens_shortcuts(mut self) -> Self {
-        self.target = HintTarget::Shortcuts;
-        self
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventResult {
@@ -102,19 +53,19 @@ impl MenuItem {
     }
 }
 
-/// Things a mode asks the app to do.
+/// Things a pane asks the app to do.
 pub enum Effect {
     Toast { msg: String, detail: String },
     OpenMenu { x: u16, y: u16, items: Vec<MenuItem> },
-    /// Modal confirmation; on confirm its `action` comes back through [`Mode::on_action`].
+    /// Modal confirmation; on confirm its `action` comes back through [`Pane::on_action`].
     Confirm(Confirm),
-    /// Offered to every mode; the first one that accepts it becomes the active mode.
+    /// A [`requests`] value the app carries out (it may touch both panes).
     Request(Box<dyn Any>),
-    /// The "Run…" dialog; on accept the command runs in a new terminal tab.
+    /// The "Run…" dialog; on accept the command is typed into the tab's terminal.
     Run(crate::run::RunPrompt),
 }
 
-/// App-wide state that modes may read.
+/// App-wide state that panes may read.
 pub struct Shared {
     pub theme: Theme,
     pub config: Config,
@@ -122,6 +73,8 @@ pub struct Shared {
     pub tx: EventSender,
     /// Preferences remembered between runs.
     pub state: crate::state::StateStore,
+    /// `--demo`: sample files that are not on disk, and nothing real on screen.
+    pub demo: bool,
 }
 
 pub struct ModeCtx<'a> {
@@ -139,7 +92,7 @@ impl<'a> ModeCtx<'a> {
     }
 
     /// Opens a context menu at screen position `(x, y)`; the chosen `action` comes back
-    /// through [`Mode::on_action`].
+    /// through [`Pane::on_action`].
     pub fn open_menu(&mut self, x: u16, y: u16, items: Vec<MenuItem>) {
         self.effects.push(Effect::OpenMenu { x, y, items });
     }
@@ -153,30 +106,19 @@ impl<'a> ModeCtx<'a> {
         self.effects.push(Effect::Run(prompt));
     }
 
-    /// Sends a request (see [`requests`]) to the mode that handles it and switches to that mode.
+    /// Asks the app to carry out a request (see [`requests`]).
     pub fn request<T: Any>(&mut self, request: T) {
         self.effects.push(Effect::Request(Box::new(request)));
     }
 }
 
-pub trait Mode {
-    fn name(&self) -> &str;
-    /// A short glyph shown before the name, e.g. `>_`.
-    fn icon(&self) -> &str;
-
-    fn tabs(&self) -> Vec<TabInfo>;
-    fn active_tab(&self) -> usize;
-    fn select_tab(&mut self, idx: usize);
-    fn new_tab(&mut self, ctx: &mut ModeCtx);
-    /// Only called when the mode has more than one tab.
-    fn close_tab(&mut self, idx: usize, ctx: &mut ModeCtx);
-
-    /// Height of the mode's own bar below the tab bar (0 for none).
+pub trait Pane {
+    /// Height of the pane's own bar above its content (0 for none).
     fn toolbar_height(&self) -> u16 {
         0
     }
     fn render_toolbar(&mut self, _f: &mut Frame, _area: Rect, _shared: &Shared) {}
-    /// Draws the content and records the mode's own hit targets.
+    /// Draws the active tab's content and records the pane's own hit targets.
     fn render(&mut self, f: &mut Frame, area: Rect, shared: &Shared);
 
     fn handle_key(&mut self, key: KeyEvent, ctx: &mut ModeCtx) -> EventResult;
@@ -189,25 +131,17 @@ pub trait Mode {
     }
     /// A context menu item was chosen, or a confirmation dialog was accepted.
     fn on_action(&mut self, _action: u32, _ctx: &mut ModeCtx) {}
-    /// Returns true when the mode handled a request sent by another mode.
-    fn handle_request(&mut self, _request: &dyn Any, _ctx: &mut ModeCtx) -> bool {
-        false
-    }
 
+    /// Status line text while this pane has the focus.
     fn status(&self, shared: &Shared) -> String;
 
-    /// Shortcuts shown as keycaps in the bottom bar, next to the status.
-    fn hints(&self, _shared: &Shared) -> Vec<KeyHint> {
-        Vec::new()
-    }
-
-    /// Extra items for the app's shortcuts menu (after the tab actions); a chosen item
-    /// comes back through [`Mode::on_action`].
+    /// Items for the app's shortcuts menu; a chosen item comes back through
+    /// [`Pane::on_action`]. The hint is the key (pressed directly, or after the leader).
     fn shortcut_items(&self) -> Vec<MenuItem> {
         Vec::new()
     }
 
-    /// When true, every key goes to the mode (e.g. a terminal); only the leader key
+    /// When true, every key goes to the pane (e.g. a terminal); only the leader key
     /// reaches the app's global shortcuts.
     fn captures_input(&self) -> bool {
         false

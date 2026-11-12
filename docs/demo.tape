@@ -19,30 +19,26 @@ Enter
 Sleep 2s
 Show
 
-# Terminal mode: real shells in tabs
-Sleep 1s
-Type "echo 'real shells, one per tab'"
-Sleep 300ms
-Enter
+# Files on top, a real shell below
 Sleep 1.2s
-Ctrl+]
-Type "t"
-Sleep 1.2s
-Type "uptime"
-Sleep 300ms
-Enter
-Sleep 1.5s
-
-# Switch to Files
-Ctrl+]
-Type "2"
-Sleep 1.5s
-
-# Open a folder and come back
 Enter
 Sleep 1.2s
 Backspace
 Sleep 1s
+
+# Focus the terminal and use it; then full screen and back
+Type "`"
+Sleep 600ms
+Type "echo 'a real shell under every tab'"
+Sleep 300ms
+Enter
+Sleep 1.2s
+Ctrl+]
+Type "z"
+Sleep 1.5s
+Ctrl+]
+Type "z"
+Sleep 1.5s
 
 # Select two items and copy them from the context menu
 Space
@@ -90,7 +86,7 @@ Sleep 300ms
 Type "e"
 Sleep 2.2s
 
-# Run…: build a command for a file; it would run in a new terminal tab
+# Run…: build a command for a file; it would run in the terminal below
 Backspace
 Sleep 800ms
 Type "G"

@@ -1,14 +1,15 @@
 # smtui — server manager TUI
 
-![smtui: terminal tabs and a file browser with copy, paste and delete](docs/demo.gif)
+![smtui: a file browser with a terminal below it, in tabs](docs/demo.gif)
 
-A terminal UI that runs **on the server**, with mouse and keyboard support. It has two modes:
+A terminal UI that runs **on the server**, with mouse and keyboard support. Every tab is a
+workspace, like an editor window:
 
-- **Terminal**: real local shells (`$SHELL -l`) in tabs, using a PTY plus a VT100 emulator.
-  "Open Files here" shows the shell's current folder in the file browser.
-- **Files**: a file browser with tabs, multi-selection, two-step copy/move/paste, "Run…" to
-  run a command on a file in a new terminal tab, and a "Copy scp command" action for
-  downloading files to your machine.
+- **Files** on top: a file browser with multi-selection, two-step copy/move/paste, "Run…" to
+  run a command on a file, and a "Copy scp command" action for downloading files to your machine.
+- **Terminal** below: a real local shell (`$SHELL -l`, through a PTY plus a VT100 emulator) that
+  **follows the Files folder**. It can be minimized to its header row, take half of the screen,
+  or cover Files (full screen).
 
 The usual workflow:
 
@@ -45,7 +46,8 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 scp target/x86_64-unknown-linux-musl/release/smtui deploy@edge1:~/.local/bin/
 ```
 
-`smtui --demo` starts with an in-memory sample file system, which is handy for trying the UI.
+`smtui --demo` starts with an in-memory sample file system, which is handy for trying the UI
+(its folders are not on disk, so there the terminal stays where it started instead of following).
 
 ## tmux setup
 
@@ -68,27 +70,45 @@ To send right clicks to smtui, enable *Settings › Pointer › Right-click repo
 *Ctrl-click reported to apps* if you use Ctrl-click), or run
 `defaults write com.googlecode.iterm2 ReportRightClick -bool true` and restart iTerm2.
 
+## The terminal follows Files
+
+When the folder in Files changes (you open a folder, go up, or the folder is moved or deleted),
+smtui types ` cd <folder>` into the tab's shell. The leading space keeps it out of the history
+with `HISTCONTROL=ignorespace` (bash, the Ubuntu default) or `setopt HIST_IGNORE_SPACE` (zsh).
+Anything you had typed at the prompt without pressing Enter is cleared first.
+
+It only does this while the shell is at its prompt. When a program is running (vim, `tail -f`,
+a nested shell, ssh…), nothing is typed into it: the header shows
+`● tail is running · cd logs when it exits`, the tab gets a `●`, and the `cd` happens once the
+program exits. It is one way: `cd` in the shell does not move Files (the header shows where the
+shell is; "Show shell folder in Files" brings Files there).
+
 ## Keys
 
-The mouse works everywhere: click tabs, `×` closes a tab, `+` opens one, the bottom bar switches
-modes, **× Quit** (bottom right) exits, right click opens the context menu.
+The mouse works everywhere: click tabs, `×` closes a tab, `+` opens one, click a pane to type
+in it, the terminal header's `min` / `half` / `full` resize it (click `TERMINAL` to minimize or
+open it), **Shortcuts** and **Quit** are at the bottom right, right click opens the context menu.
 
 `Ctrl+Q` is reserved for quitting, so it never reaches programs in the terminal (it is the
 XON flow-control key in most shells and rarely used).
 
-**Global** (in Files mode directly; in Terminal mode after the leader key, default `Ctrl+]`):
+**Global** (with Files focused directly; with the terminal focused after the leader key,
+default `Ctrl+]`, because every other key goes to the shell):
 
 | Key | Action |
 |---|---|
-| `Ctrl+]` then `t` | New tab |
+| `Ctrl+]` then `t` | New tab (in the current folder) |
 | `Ctrl+]` then `w` | Close tab |
 | `Ctrl+]` then `n` / `p` | Next / previous tab |
-| `Ctrl+]` then `1`…`9` | Switch mode |
-| `Ctrl+]` then `?` (or `?` in Files) | Shortcuts menu |
-| `Ctrl+]` then `f`, or right click in a shell | Open Files in the shell's current folder |
-| `Ctrl+Q` (any mode), `Ctrl+]` then `q`, or the **Quit** button | Quit |
+| `` ` `` in Files, `Ctrl+]` then `` ` `` in the terminal | Switch the focus between Files and the terminal |
+| `Ctrl+]` then `z` | Terminal size: minimized → half → full screen |
+| `Ctrl+]` then `?` (or `?` in Files), the **Shortcuts** button | Shortcuts menu (also: hidden files, refresh) |
+| `Ctrl+]` then `f`, or right click in a shell | Show the shell's current folder in Files |
+| `Ctrl+Q` (anywhere), `Ctrl+]` then `q`, or the **Quit** button | Quit |
 | `Ctrl+]` `Ctrl+]` | Send `Ctrl+]` to the shell |
-| `Ctrl+T`, `Ctrl+W`, `Tab` / `Shift+Tab`, `F1`/`F2`, `q` | Same, in Files mode |
+| `Ctrl+T`, `Ctrl+W`, `Tab` / `Shift+Tab`, `q` | Same, with Files focused |
+
+Full screen gives the keys to the terminal; minimizing gives them to Files.
 
 **Files**
 
@@ -99,6 +119,7 @@ XON flow-control key in most shells and rarely used).
 | `Shift`+click | Select a range |
 | Click on empty space | Clear the selection |
 | Double click, `Enter` | Open folder |
+| Mouse wheel, the scrollbar on the right (click or drag) | Scroll long folders |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | Move the cursor |
 | `Space` | Toggle the cursor item in the selection |
 | `Backspace`, `←` | Up one level |
@@ -111,23 +132,24 @@ XON flow-control key in most shells and rarely used).
 | `u` | Copy an upload command with a `<LOCAL_PATH>` placeholder |
 | `z` | Compress the selection to `name.tar.gz` (never overwrites: `name (2).tar.gz`…); disabled for archives |
 | `e` | Extract the selected archives (`.tar.gz` `.tgz` `.tar.bz2` `.tar.xz` `.tar.zst` `.tar` `.zip`) next to them |
-| `t` | Open a terminal tab in the selected folder (or the current one) |
-| `!` | Run… a command on the selection in a new terminal tab (see below) |
-| `.` | Toggle hidden files (also in the Shortcuts menu) |
+| `t` | Open a new tab in the selected folder (or the current one) |
+| `!` | Run… a command on the selection in the terminal below (see below) |
+| `.` | Toggle hidden files (also in the Shortcuts menu, `Ctrl+]` then `.` from the terminal) |
 | `r`, the **↻** button | Refresh the folder (e.g. after an upload) |
 | `Delete`, `d` | Delete the selection (asks you to type `DELETE` to confirm) |
 
 **Uploading from your computer.** smtui runs on the server, so it cannot read your local files,
 but it can write the command for you: drag files from Finder (or your file manager) onto the
-terminal window while in Files mode. Terminals paste the dropped paths as text; smtui turns them
+terminal window while Files has the focus. Terminals paste the dropped paths as text; smtui turns them
 into `scp -r <your files> user@host:<open folder>/`, copies it to your clipboard, and you run it in
 a local terminal. "Copy upload command" in the context menu (or `u`) does the same with a
 `<LOCAL_PATH>` placeholder.
 
 **Run…** (`!` or the context menu) opens a dialog with three lines: the command (`vim`,
 `less +F`, `python3`…), the selected path (always quoted, never editable) and extra arguments.
-It shows the exact command line before running it, then types it into a new terminal tab in the
-file's folder, so it is in your shell history and `Ctrl+C` works. Suggestions depend on the file
+It shows the exact command line before running it, then types it into the tab's terminal (opening
+it if minimized), so it is in your shell history and `Ctrl+C` works. If a program is already
+running there, the command goes to a new tab in the same folder instead. Suggestions depend on the file
 type, and `↑`/`↓` bring back what you ran last for that type (stored in
 `~/.local/state/smtui/run_history.tsv`, readable only by you). Commands that look destructive
 (`rm`, `dd`, `mkfs`, `> file`…) need a second Enter; the dialog also warns when smtui runs as
@@ -142,7 +164,8 @@ archive (`backup/`); if the name is taken, `backup (2)`. Zip files need `unzip` 
 
 Copy and Move work in two steps: mark the items, open the destination (in any tab) and Paste.
 Name clashes become `name (copy)`, `name (copy 2)`…; moving into the same folder and pasting a
-folder into itself are skipped with a notice. Tabs open inside a moved folder follow it.
+folder into itself are skipped with a notice. Tabs open inside a moved folder follow it (and so
+do their shells).
 
 > **Ctrl+click, not Cmd+click.** Terminals do not pass Cmd+click to applications. Some terminals
 > also treat Ctrl+click as a right click (macOS Terminal.app); use `Space` or Shift+click there.
@@ -153,7 +176,7 @@ folder into itself are skipped with a notice. Tabs open inside a moved folder fo
 
 ```toml
 accent = "#5eead4"     # highlight color
-leader = "ctrl-]"      # prefix for global shortcuts in Terminal mode
+leader = "ctrl-]"      # prefix for global shortcuts while the terminal has the focus
 show_hidden = true     # show dotfiles at first; then smtui remembers your last toggle
 # truecolor = true     # force 24-bit color (auto-detected from $COLORTERM)
 
@@ -177,8 +200,9 @@ cargo run -- --demo
 The GIF above is recorded with [VHS](https://github.com/charmbracelet/vhs) from `docs/demo.tape`:
 `cargo build --release && vhs docs/demo.tape`.
 
-New modes implement the `Mode` trait in `src/modes/mod.rs` and are registered in `src/main.rs`;
-the tab bar and the bottom bar are generated from the registered modes.
+Each tab is a workspace of two panes, which implement the `Pane` trait in `src/modes/mod.rs`:
+`FilesMode` and `TerminalMode` keep one entry per tab, aligned by index, and `src/app.rs` keeps
+them in step and owns the terminal size, the focus and the folder-following.
 
 ## License
 

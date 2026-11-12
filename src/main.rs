@@ -18,14 +18,14 @@ use crate::{
     config::Config,
     host::HostInfo,
     modes::{
-        Mode, Shared,
+        Shared,
         files::{FilesMode, fs::Fs, local::LocalFs, memory::MemoryFs},
         terminal::TerminalMode,
     },
     ui::{terminal_guard::TerminalGuard, theme::Theme},
 };
 
-/// smtui — server manager TUI: terminals and a file browser for the machine it runs on.
+/// smtui — server manager TUI: a file browser with a terminal below it, for the machine it runs on.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
         tx: tx.clone(),
         // The demo must not change the user's real preferences.
         state: if cli.demo { state::StateStore::in_memory() } else { state::StateStore::default_location() },
+        demo: cli.demo,
     };
 
     let (fs, files_dir): (std::sync::Arc<dyn Fs>, PathBuf) = if cli.demo {
@@ -68,11 +69,9 @@ async fn main() -> Result<()> {
     };
 
     let mut guard = TerminalGuard::new().context("failed to set up the terminal")?;
-    let modes: Vec<Box<dyn Mode>> = vec![
-        Box::new(TerminalMode::new(start_dir, tx.clone())),
-        Box::new(FilesMode::new(fs, files_dir, &shared)),
-    ];
-    let result = app::App::new(shared, modes).run(&mut guard.terminal, rx).await;
+    let files = FilesMode::new(fs, files_dir, &shared);
+    let term = TerminalMode::new(start_dir, tx.clone());
+    let result = app::App::new(shared, files, term).run(&mut guard.terminal, rx).await;
     drop(guard);
     result
 }

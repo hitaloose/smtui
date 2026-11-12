@@ -1,9 +1,10 @@
-//! Terminal mode: one local shell per tab, rendered with `tui-term`.
+//! Terminal pane: one local shell per tab, rendered with `tui-term`. It follows the Files
+//! pane above it: when the folder there changes, the shell is sent `cd` (see [`TerminalMode::follow`]).
 
 mod input;
 mod session;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -16,22 +17,17 @@ use ratatui::{
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use self::session::{TermEvent, TerminalSession};
-use super::{
-    EventResult, KeyHint, MenuItem, Mode, ModeCtx, Shared, TabInfo,
-    requests::{OpenFiles, OpenTerminal},
-};
+use super::{EventResult, MenuItem, ModeCtx, Pane, Shared, requests::ShowInFiles};
 use crate::event::{AppEvent, EventSender};
 
 mod action {
-    pub const OPEN_FILES: u32 = 1;
+    pub const SHOW_IN_FILES: u32 = 1;
     pub const COPY_PATH: u32 = 2;
 }
 
 struct TermTab {
-    number: u64,
+    /// Where the shell starts, then the last folder it was sent to.
     cwd: PathBuf,
-    /// Folder name for tabs opened in a specific folder.
-    label: Option<String>,
     session: Option<TerminalSession>,
     /// Why the shell is not running (exited, or failed to start).
     notice: Option<String>,
@@ -41,35 +37,136 @@ struct TermTab {
     needs_start: bool,
     /// Command typed into the shell when it first starts ("Run…" from Files).
     typed: Option<String>,
+    /// Folder to `cd` into once the program in the foreground exits.
+    pending: Option<PathBuf>,
+    /// The program in the foreground (process group, name), refreshed by [`TerminalMode::poll`].
+    busy: Option<(u32, String)>,
 }
 
 pub struct TerminalMode {
-    cwd: PathBuf,
     tx: EventSender,
     tabs: Vec<TermTab>,
     active: usize,
-    next_number: u64,
     next_session: u64,
     area: Rect,
+    /// Keys go here: the cursor is only drawn when focused.
+    pub focused: bool,
 }
 
 impl TerminalMode {
     pub fn new(cwd: PathBuf, tx: EventSender) -> Self {
-        let mut mode = Self { cwd, tx, tabs: Vec::new(), active: 0, next_number: 1, next_session: 1, area: Rect::new(0, 0, 80, 24) };
-        mode.open_tab();
+        let mut mode = Self { tx, tabs: Vec::new(), active: 0, next_session: 1, area: Rect::new(0, 0, 80, 24), focused: false };
+        mode.open_tab(cwd, None);
         mode
     }
 
-    fn open_tab(&mut self) {
-        let cwd = self.cwd.clone();
-        self.open_tab_at(cwd, None, None);
+    /// Adds a tab at the end and makes it active; `typed` is run once the shell is ready.
+    pub fn open_tab(&mut self, cwd: PathBuf, typed: Option<String>) {
+        self.tabs.push(TermTab {
+            cwd,
+            session: None,
+            notice: None,
+            scroll: 0,
+            needs_start: true,
+            typed,
+            pending: None,
+            busy: None,
+        });
+        self.active = self.tabs.len() - 1;
     }
 
-    fn open_tab_at(&mut self, cwd: PathBuf, label: Option<String>, typed: Option<String>) {
-        let number = self.next_number;
-        self.next_number += 1;
-        self.tabs.push(TermTab { number, cwd, label, session: None, notice: None, scroll: 0, needs_start: true, typed });
-        self.active = self.tabs.len() - 1;
+    pub fn close_tab(&mut self, idx: usize) {
+        if self.tabs.len() > 1 && idx < self.tabs.len() {
+            self.tabs.remove(idx); // dropping the session kills the shell
+            if self.active > idx || self.active >= self.tabs.len() {
+                self.active = self.active.saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn select_tab(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            self.active = idx;
+        }
+    }
+
+    /// Makes the shell of tab `idx` follow the Files pane into `dir`: right away when the
+    /// shell is at its prompt, otherwise once the program in the foreground exits.
+    pub fn follow(&mut self, idx: usize, dir: &Path) {
+        // e.g. the in-memory demo file system.
+        if !dir.is_dir() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        tab.pending = None;
+        match &mut tab.session {
+            Some(session) if !session.is_idle() => tab.pending = Some(dir.to_path_buf()),
+            Some(session) => {
+                send_cd(session, dir);
+                tab.cwd = dir.to_path_buf();
+                tab.scroll = 0;
+            }
+            // Starts (or restarts) there.
+            None => tab.cwd = dir.to_path_buf(),
+        }
+    }
+
+    /// Refreshes which tabs run a program and sends pending `cd`s to shells that are back
+    /// at their prompt. Returns true when something visible changed.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let job = tab.session.as_ref().and_then(TerminalSession::foreground_job);
+            if job != tab.busy.as_ref().map(|(pgid, _)| *pgid) {
+                // The name is looked up only when the foreground job changes.
+                tab.busy = job.map(|pgid| (pgid, session::process_name(pgid).unwrap_or_else(|| "a program".into())));
+                changed = true;
+            }
+            if tab.busy.is_none()
+                && let (Some(dir), Some(session)) = (tab.pending.take(), &mut tab.session)
+            {
+                send_cd(session, &dir);
+                tab.cwd = dir;
+                tab.scroll = 0;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Types `command` into the shell of tab `idx`. False when a program is running there
+    /// (or the shell has exited), so the caller can open a new tab instead.
+    pub fn run_in(&mut self, idx: usize, command: &str) -> bool {
+        let Some(tab) = self.tabs.get_mut(idx) else { return false };
+        if tab.needs_start {
+            tab.typed = Some(command.to_string());
+            return true;
+        }
+        match &mut tab.session {
+            Some(session) if session.is_idle() => {
+                session.type_line(command);
+                tab.scroll = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The program running in tab `idx`, if any.
+    pub fn busy(&self, idx: usize) -> Option<&str> {
+        self.tabs.get(idx).and_then(|t| t.busy.as_ref()).map(|(_, name)| name.as_str())
+    }
+
+    /// Folder the shell of tab `idx` waits to `cd` into.
+    pub fn pending(&self, idx: usize) -> Option<&Path> {
+        self.tabs.get(idx).and_then(|t| t.pending.as_deref())
+    }
+
+    /// The folder shown in the terminal header: the shell's own where cheap to read,
+    /// else the last folder it was sent to.
+    pub fn shown_dir(&self, idx: usize) -> PathBuf {
+        let tab = &self.tabs[idx];
+        tab.session.as_ref().and_then(TerminalSession::shell_cwd).unwrap_or_else(|| tab.cwd.clone())
     }
 
     fn start_shell(&mut self, idx: usize) {
@@ -79,6 +176,7 @@ impl TerminalMode {
         let tab = &mut self.tabs[idx];
         tab.scroll = 0;
         tab.needs_start = false;
+        tab.pending = None;
         match TerminalSession::spawn(session_id, &tab.cwd, rows, cols, tab.typed.take(), self.tx.clone()) {
             Ok(s) => {
                 tab.session = Some(s);
@@ -103,52 +201,37 @@ impl TerminalMode {
     }
 }
 
-impl TerminalMode {
-    /// `Ctrl-] f`: menu hints show the leader before the key.
-    fn leader_hint(&self, ctx: &ModeCtx, key: &str) -> String {
-        format!("{} {key}", crate::keys::display(&ctx.shared.config.leader))
+/// ` cd ..`, ` cd -- name` or ` cd -- '/abs/path'`: the shortest that works from where the
+/// shell is. The leading space keeps it out of the history (HISTCONTROL=ignorespace, zsh's
+/// HIST_IGNORE_SPACE). Skipped when the shell is already there.
+fn send_cd(session: &mut TerminalSession, dir: &Path) {
+    let here = session.cwd();
+    if here.as_deref() == Some(dir) {
+        return;
     }
+    session.type_line(&cd_line(here.as_deref(), dir));
 }
 
-impl Mode for TerminalMode {
-    fn name(&self) -> &str {
-        "Terminal"
-    }
-
-    fn icon(&self) -> &str {
-        ">_"
-    }
-
-    fn tabs(&self) -> Vec<TabInfo> {
-        self.tabs
-            .iter()
-            .map(|t| TabInfo { title: t.label.clone().unwrap_or_else(|| format!("shell {}", t.number)) })
-            .collect()
-    }
-
-    fn active_tab(&self) -> usize {
-        self.active
-    }
-
-    fn select_tab(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
-            self.active = idx;
+fn cd_line(here: Option<&Path>, dir: &Path) -> String {
+    let quote = |s: &str| crate::modes::files::ops::shell_quote(s).into_owned();
+    if let Some(here) = here {
+        if here.parent() == Some(dir) {
+            return " cd ..".into();
         }
-    }
-
-    fn new_tab(&mut self, _ctx: &mut ModeCtx) {
-        self.open_tab();
-    }
-
-    fn close_tab(&mut self, idx: usize, _ctx: &mut ModeCtx) {
-        if self.tabs.len() > 1 && idx < self.tabs.len() {
-            self.tabs.remove(idx); // dropping the session kills the shell
-            if self.active > idx || self.active >= self.tabs.len() {
-                self.active = self.active.saturating_sub(1);
+        if let (Some(parent), Some(name)) = (dir.parent(), dir.file_name())
+            && parent == here
+        {
+            let name = name.to_string_lossy();
+            // `-` alone means the previous folder to `cd`, even after `--` in some shells.
+            if name != "-" {
+                return format!(" cd -- {}", quote(&name));
             }
         }
     }
+    format!(" cd -- {}", quote(&dir.to_string_lossy()))
+}
 
+impl Pane for TerminalMode {
     fn render(&mut self, f: &mut Frame, area: Rect, shared: &Shared) {
         self.area = area;
         if self.tabs[self.active].needs_start {
@@ -164,7 +247,7 @@ impl Mode for TerminalMode {
             tab.scroll = parser.screen().scrollback();
             let screen = parser.screen();
             let mut cursor = Cursor::default().style(Style::new().bg(theme.accent).fg(theme.bg));
-            if screen.hide_cursor() || tab.scroll > 0 {
+            if screen.hide_cursor() || tab.scroll > 0 || !self.focused {
                 cursor.hide();
             }
             f.render_widget(
@@ -271,8 +354,9 @@ impl Mode for TerminalMode {
             }
             // Right click on a plain shell (the program did not ask for the mouse).
             MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
+                let leader = crate::keys::display(&ctx.shared.config.leader);
                 ctx.open_menu(ev.column, ev.row, vec![
-                    MenuItem::action("Open Files here", action::OPEN_FILES).with_hint(self.leader_hint(ctx, "f")),
+                    MenuItem::action("Show shell folder in Files", action::SHOW_IN_FILES).with_hint(format!("{leader} f")),
                     MenuItem::action("Copy current folder path", action::COPY_PATH),
                 ]);
             }
@@ -283,7 +367,7 @@ impl Mode for TerminalMode {
 
     fn on_action(&mut self, action: u32, ctx: &mut ModeCtx) {
         match action {
-            action::OPEN_FILES => ctx.request(OpenFiles { path: self.current_dir() }),
+            action::SHOW_IN_FILES => ctx.request(ShowInFiles { path: self.current_dir() }),
             action::COPY_PATH => {
                 let path = self.current_dir().to_string_lossy().into_owned();
                 let msg = match crate::clipboard::copy(&path, ctx.shared.host.in_tmux) {
@@ -297,7 +381,7 @@ impl Mode for TerminalMode {
     }
 
     fn shortcut_items(&self) -> Vec<MenuItem> {
-        vec![MenuItem::action("Open Files here", action::OPEN_FILES).with_hint("f")]
+        vec![MenuItem::action("Show shell folder in Files", action::SHOW_IN_FILES).with_hint("f")]
     }
 
     fn handle_app_event(&mut self, ev: &AppEvent, ctx: &mut ModeCtx) -> EventResult {
@@ -310,6 +394,11 @@ impl Mode for TerminalMode {
             TermEvent::Exited(id) => {
                 if let Some(tab) = self.tab_by_session(*id) {
                     tab.session = None;
+                    tab.busy = None;
+                    // A new shell starts in the folder Files moved to meanwhile.
+                    if let Some(dir) = tab.pending.take() {
+                        tab.cwd = dir;
+                    }
                     tab.notice = Some("Process exited. Press Enter to start a new shell.".into());
                 }
             }
@@ -317,31 +406,31 @@ impl Mode for TerminalMode {
         EventResult::Consumed
     }
 
-    fn handle_request(&mut self, request: &dyn std::any::Any, ctx: &mut ModeCtx) -> bool {
-        let Some(req) = request.downcast_ref::<OpenTerminal>() else { return false };
-        let label = req.label.clone().unwrap_or_else(|| {
-            req.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into())
-        });
-        let cwd = if req.cwd.is_dir() {
-            req.cwd.clone()
-        } else {
-            // e.g. the in-memory demo file system: fall back to the start folder.
-            ctx.toast(format!("{} does not exist on disk", req.cwd.display()), format!("Opened in {}", self.cwd.display()));
-            self.cwd.clone()
-        };
-        self.open_tab_at(cwd, Some(label), req.command.clone());
-        true
-    }
-
     fn status(&self, shared: &Shared) -> String {
-        shared.host.label()
-    }
-
-    fn hints(&self, shared: &Shared) -> Vec<KeyHint> {
-        vec![KeyHint::new(crate::keys::display(&shared.config.leader), "Shortcuts").opens_shortcuts()]
+        // The demo's shell runs in a real folder of this machine: keep it off screen.
+        if shared.demo {
+            return shared.host.label();
+        }
+        format!("{} · shell in {}", shared.host.label(), crate::ui::bars::tilde(&self.shown_dir(self.active)))
     }
 
     fn captures_input(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cd_takes_the_shortest_form() {
+        let p = Path::new;
+        assert_eq!(cd_line(Some(p("/srv/app")), p("/srv")), " cd ..");
+        assert_eq!(cd_line(Some(p("/srv")), p("/srv/app")), " cd -- app");
+        assert_eq!(cd_line(Some(p("/srv")), p("/srv/my app")), " cd -- 'my app'");
+        assert_eq!(cd_line(Some(p("/srv")), p("/srv/-")), " cd -- /srv/-");
+        assert_eq!(cd_line(Some(p("/srv")), p("/etc/nginx")), " cd -- /etc/nginx");
+        assert_eq!(cd_line(None, p("/var/log")), " cd -- /var/log");
     }
 }

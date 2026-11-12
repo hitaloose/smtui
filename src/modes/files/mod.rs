@@ -1,4 +1,5 @@
-//! Files mode: a file browser with tabs, multi-selection and two-step copy/move/paste.
+//! Files pane: a file browser (one folder per tab) with multi-selection and two-step
+//! copy/move/paste. The clipboard of marked items is shared by all tabs.
 
 pub mod fs;
 pub mod local;
@@ -9,7 +10,7 @@ pub mod view;
 
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,7 @@ use self::{
     tab::FilesTab,
     view::FilesTarget,
 };
-use super::{EventResult, KeyHint, MenuItem, Mode, ModeCtx, Shared, TabInfo, requests::{OpenFiles, OpenTerminal}};
+use super::{EventResult, MenuItem, ModeCtx, Pane, Shared, requests::OpenTab};
 use crate::{clipboard, event::AppEvent, event::EventSender, ui::dialog::Confirm, ui::hit::HitMap};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -92,6 +93,10 @@ pub struct FilesMode {
     /// Entries waiting for the delete confirmation: (folder, [(name, is_dir)]).
     pending_delete: Option<(PathBuf, Vec<(OsString, bool)>)>,
     deleting: bool,
+    /// Keys go here: the cursor row is only highlighted when focused.
+    pub focused: bool,
+    /// Dragging the scrollbar thumb.
+    dragging_scrollbar: bool,
     compressing: bool,
     extracting: bool,
 }
@@ -116,6 +121,8 @@ impl FilesMode {
             menu_folder: None,
             pending_delete: None,
             deleting: false,
+            focused: true,
+            dragging_scrollbar: false,
             compressing: false,
             extracting: false,
         };
@@ -123,12 +130,54 @@ impl FilesMode {
         mode
     }
 
-    fn open_tab(&mut self, path: PathBuf) {
+    /// Adds a tab at the end and makes it active.
+    pub fn open_tab(&mut self, path: PathBuf) {
         let id = self.next_id;
         self.next_id += 1;
         self.tabs.push(FilesTab::new(id, path));
         self.active = self.tabs.len() - 1;
         self.load(self.active);
+    }
+
+    pub fn close_tab(&mut self, idx: usize) {
+        if self.tabs.len() > 1 && idx < self.tabs.len() {
+            self.tabs.remove(idx);
+            if self.active > idx || self.active >= self.tabs.len() {
+                self.active = self.active.saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn select_tab(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            self.active = idx;
+            self.last_click = None;
+            self.dragging_scrollbar = false;
+        }
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn active_tab(&self) -> usize {
+        self.active
+    }
+
+    pub fn title(&self, idx: usize) -> String {
+        self.tabs[idx].title()
+    }
+
+    /// The folder open in tab `idx`.
+    pub fn path(&self, idx: usize) -> &Path {
+        &self.tabs[idx].path
+    }
+
+    /// Opens `path` in the active tab.
+    pub fn show(&mut self, path: PathBuf) {
+        if path != self.tabs[self.active].path {
+            self.navigate(path);
+        }
     }
 
     fn tab(&mut self) -> &mut FilesTab {
@@ -189,6 +238,25 @@ impl FilesMode {
         let last = tab.entries.len() as isize - 1;
         tab.cursor = (tab.cursor as isize + delta).clamp(0, last) as usize;
         tab.ensure_cursor_visible(h);
+    }
+
+    /// Scrolls the list and keeps the cursor on screen, so the next render does not scroll back.
+    fn set_scroll(&mut self, scroll: usize) {
+        let h = self.list_height();
+        let tab = self.tab();
+        let max = tab.entries.len().saturating_sub(h);
+        tab.scroll = scroll.min(max);
+        let last = tab.entries.len().saturating_sub(1);
+        tab.cursor = tab.cursor.clamp(tab.scroll, (tab.scroll + h).saturating_sub(1).min(last));
+    }
+
+    /// Scrollbar click or drag at screen row `y`: centers the list on that point.
+    fn scroll_to_row(&mut self, y: u16) {
+        let body = self.list_body;
+        let (h, total) = (self.list_height(), self.tabs[self.active].entries.len());
+        let offset = y.saturating_sub(body.y).min(body.height.saturating_sub(1)) as usize;
+        let target = view::scroll_for_row(offset, h, total);
+        self.set_scroll(target);
     }
 
     /// Keyboard actions with nothing selected act on the entry under the cursor.
@@ -459,7 +527,7 @@ impl FilesMode {
 
     // ---- Run ----
 
-    /// Opens the "Run…" dialog for the selection. The command runs in a new terminal tab.
+    /// Opens the "Run…" dialog for the selection. The command runs in this tab's terminal.
     fn ask_run(&mut self, ctx: &mut ModeCtx) {
         let tab = &self.tabs[self.active];
         let paths: Vec<(PathBuf, bool)> = tab.selected_entries().iter().map(|e| (tab.path.join(&e.name), e.is_dir())).collect();
@@ -629,8 +697,8 @@ impl FilesMode {
                 action::UPLOAD,
             ).with_hint("u"));
             items.push(match &single_dir {
-                Some(_) => MenuItem::action("Open in terminal", action::TERMINAL),
-                None => MenuItem::action("Open terminal here", action::TERMINAL),
+                Some(_) => MenuItem::action("Open in new tab", action::TERMINAL).with_hint("t"),
+                None => MenuItem::action("New tab here", action::TERMINAL).with_hint("t"),
             });
             items.push(MenuItem::Separator);
             items.push(
@@ -640,7 +708,7 @@ impl FilesMode {
             items.push(MenuItem::action("Paste here", action::PASTE_HERE).with_hint(paste_hint).enabled(can_paste));
             items.push(MenuItem::Separator);
             items.push(MenuItem::action("Copy upload command here", action::UPLOAD).with_hint("u"));
-            items.push(MenuItem::action("Open terminal here", action::TERMINAL));
+            items.push(MenuItem::action("New tab here", action::TERMINAL).with_hint("t"));
         }
         self.menu_folder = Some(match (&single_dir, on_item) {
             (Some(dir), true) => dir.clone(),
@@ -723,44 +791,7 @@ fn label_for<'a>(names: impl Iterator<Item = &'a OsString>) -> String {
     }
 }
 
-impl Mode for FilesMode {
-    fn name(&self) -> &str {
-        "Files"
-    }
-
-    fn icon(&self) -> &str {
-        "▤"
-    }
-
-    fn tabs(&self) -> Vec<TabInfo> {
-        self.tabs.iter().map(|t| TabInfo { title: t.title() }).collect()
-    }
-
-    fn active_tab(&self) -> usize {
-        self.active
-    }
-
-    fn select_tab(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
-            self.active = idx;
-            self.last_click = None;
-        }
-    }
-
-    fn new_tab(&mut self, _ctx: &mut ModeCtx) {
-        let path = self.tabs[self.active].path.clone();
-        self.open_tab(path);
-    }
-
-    fn close_tab(&mut self, idx: usize, _ctx: &mut ModeCtx) {
-        if self.tabs.len() > 1 && idx < self.tabs.len() {
-            self.tabs.remove(idx);
-            if self.active > idx || self.active >= self.tabs.len() {
-                self.active = self.active.saturating_sub(1);
-            }
-        }
-    }
-
+impl Pane for FilesMode {
     fn toolbar_height(&self) -> u16 {
         3
     }
@@ -773,7 +804,7 @@ impl Mode for FilesMode {
 
     fn render(&mut self, f: &mut Frame, area: Rect, shared: &Shared) {
         let tab = &mut self.tabs[self.active];
-        self.list_body = view::render_list(f, area, &shared.theme, tab, self.clip.as_ref(), &mut self.hits);
+        self.list_body = view::render_list(f, area, &shared.theme, tab, self.clip.as_ref(), self.focused, &mut self.hits);
     }
 
     fn handle_key(&mut self, key: KeyEvent, ctx: &mut ModeCtx) -> EventResult {
@@ -827,7 +858,7 @@ impl Mode for FilesMode {
                     Some(e) if e.is_dir() && tab.selection.contains(&e.name) => tab.path.join(&e.name),
                     _ => tab.path.clone(),
                 };
-                ctx.request(OpenTerminal::at(cwd));
+                ctx.request(OpenTab { cwd });
             }
             KeyCode::Char('.') => self.toggle_hidden(ctx),
             KeyCode::Char('!') => {
@@ -876,16 +907,19 @@ impl Mode for FilesMode {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if over_list => {
                 let tab = self.tab();
                 let max = tab.entries.len().saturating_sub(1);
-                tab.scroll = if ev.kind == MouseEventKind::ScrollUp {
+                let scroll = if ev.kind == MouseEventKind::ScrollUp {
                     tab.scroll.saturating_sub(3)
                 } else {
                     (tab.scroll + 3).min(max)
                 };
-                // Keep the cursor on screen so the next render does not scroll back.
-                let h = self.list_body.height as usize;
-                let tab = self.tab();
-                tab.cursor = tab.cursor.clamp(tab.scroll, (tab.scroll + h).saturating_sub(1).min(max));
+                self.set_scroll(scroll);
             }
+            MouseEventKind::Down(MouseButton::Left) if matches!(self.hits.hit(ev.column, ev.row), Some(FilesTarget::Scrollbar)) => {
+                self.dragging_scrollbar = true;
+                self.scroll_to_row(ev.row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_scrollbar => self.scroll_to_row(ev.row),
+            MouseEventKind::Up(_) => self.dragging_scrollbar = false,
             MouseEventKind::Down(_) => {
                 let target = self.hits.hit(ev.column, ev.row);
                 self.handle_list_click(ev, target, ctx);
@@ -961,20 +995,11 @@ impl Mode for FilesMode {
             action::DELETE_CONFIRMED => self.delete(),
             action::TERMINAL => {
                 if let Some(cwd) = self.menu_folder.clone() {
-                    ctx.request(OpenTerminal::at(cwd));
+                    ctx.request(OpenTab { cwd });
                 }
             }
             _ => {}
         }
-    }
-
-    fn handle_request(&mut self, request: &dyn std::any::Any, _ctx: &mut ModeCtx) -> bool {
-        let Some(req) = request.downcast_ref::<OpenFiles>() else { return false };
-        match self.tabs.iter().position(|t| t.path == req.path) {
-            Some(i) => self.select_tab(i),
-            None => self.open_tab(req.path.clone()),
-        }
-        true
     }
 
     fn status(&self, shared: &Shared) -> String {
@@ -1003,15 +1028,11 @@ impl Mode for FilesMode {
         format!("{}{sel}{clip}{busy}", shared.host.label())
     }
 
-    fn hints(&self, shared: &Shared) -> Vec<KeyHint> {
-        vec![KeyHint::new(crate::keys::display(&shared.config.leader), "Shortcuts").opens_shortcuts()]
-    }
-
     fn shortcut_items(&self) -> Vec<MenuItem> {
-        let label = if self.show_hidden { "Hide hidden files" } else { "Show hidden files" };
+        let state = if self.show_hidden { "● on" } else { "○ off" };
         vec![
-            MenuItem::action("Refresh", action::REFRESH).with_hint("r"),
-            MenuItem::action(label, action::TOGGLE_HIDDEN).with_hint("."),
+            MenuItem::action(format!("Hidden files  {state}"), action::TOGGLE_HIDDEN).with_hint("."),
+            MenuItem::action("Refresh folder", action::REFRESH).with_hint("r"),
         ]
     }
 }

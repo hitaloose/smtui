@@ -1,5 +1,11 @@
-//! Event loop, layout and routing between the app chrome, overlays and the active mode.
+//! Event loop, layout and routing between the app chrome, overlays and the two panes.
+//!
+//! Every tab is a workspace: a Files pane on top and a terminal below it that follows the
+//! Files folder. Both panes keep one entry per tab, aligned by index; this file keeps them
+//! in step (new, close, select) and owns what belongs to the tab as a whole: the terminal
+//! size, which pane has the focus, and the folder the shell was last sent to.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -7,18 +13,23 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
-use ratatui::{Frame, style::Style, widgets::Paragraph};
+use ratatui::{Frame, layout::Rect, style::Style, widgets::Paragraph};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
     event::AppEvent,
     keys::KeyChord,
-    modes::{Effect, EventResult, Mode, ModeCtx, Shared},
+    modes::{
+        Effect, EventResult, MenuItem, ModeCtx, Pane, Shared,
+        files::FilesMode,
+        requests::{OpenTab, ShowInFiles},
+        terminal::TerminalMode,
+    },
     ui::{
-        AppLayout,
-        bars::{self, ChromeTarget},
-        hit::HitMap,
+        AppLayout, TermSize,
+        bars::{self, ChromeTarget, TabInfo, TermHeader},
         dialog::{DialogHit, DialogState},
+        hit::HitMap,
         menu::{MenuOwner, MenuState},
         run_dialog::{RunDialogState, RunHit, RunOutcome},
         terminal_guard::Tui,
@@ -26,23 +37,75 @@ use crate::{
     },
 };
 
-/// Actions of the app's own menus (the shortcuts menu).
+/// Actions of the app's own menu (the shortcuts menu).
 mod app_action {
     pub const NEW_TAB: u32 = 1;
     pub const CLOSE_TAB: u32 = 2;
     pub const NEXT_TAB: u32 = 3;
     pub const PREV_TAB: u32 = 4;
     pub const QUIT: u32 = 5;
-    /// `MODE_BASE + i` switches to mode `i`.
-    pub const MODE_BASE: u32 = 100;
-    /// `MODE_ACTION_BASE + a` runs action `a` of the active mode (its shortcut items).
-    pub const MODE_ACTION_BASE: u32 = 1_000_000;
+    pub const SWAP_FOCUS: u32 = 6;
+    pub const CYCLE_SIZE: u32 = 7;
+    /// `PANE_ACTION_BASE * (pane + 1) + a` runs action `a` of that pane (its shortcut items).
+    pub const PANE_ACTION_BASE: u32 = 1_000_000;
+}
+
+/// Which pane gets the keys. Doubles as the index used by menus and dialogs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Files = 0,
+    Term = 1,
+}
+
+impl Focus {
+    fn from_index(i: usize) -> Self {
+        if i == 1 { Focus::Term } else { Focus::Files }
+    }
+}
+
+/// What a tab owns besides its two panes.
+struct Workspace {
+    size: TermSize,
+    focus: Focus,
+    /// The Files folder the shell was last told to follow.
+    synced: PathBuf,
+}
+
+impl Workspace {
+    fn new(dir: PathBuf, focus: Focus) -> Self {
+        Self { size: TermSize::Normal, focus, synced: dir }
+    }
+
+    /// Full screen leaves only the terminal; minimized leaves only Files.
+    fn focus(&self) -> Focus {
+        match self.size {
+            TermSize::Full => Focus::Term,
+            TermSize::Min => Focus::Files,
+            TermSize::Normal => self.focus,
+        }
+    }
+
+    fn set_focus(&mut self, focus: Focus) {
+        self.focus = focus;
+        match (focus, self.size) {
+            (Focus::Term, TermSize::Min) => self.size = TermSize::Normal,
+            (Focus::Files, TermSize::Full) => self.size = TermSize::Normal,
+            _ => {}
+        }
+    }
+
+    fn set_size(&mut self, size: TermSize) {
+        self.size = size;
+        // Opening the terminal means you want to type in it; minimizing hands keys back.
+        self.focus = if size == TermSize::Min { Focus::Files } else { Focus::Term };
+    }
 }
 
 pub struct App {
     shared: Shared,
-    modes: Vec<Box<dyn Mode>>,
-    active_mode: usize,
+    files: FilesMode,
+    term: TerminalMode,
+    workspaces: Vec<Workspace>,
     leader: KeyChord,
     leader_pending: bool,
     menu: Option<MenuState>,
@@ -52,11 +115,13 @@ pub struct App {
     toast: Option<Toast>,
     chrome_hits: HitMap<ChromeTarget>,
     layout: AppLayout,
+    /// The pane a mouse button went down in gets the drag and the release.
+    mouse_owner: Option<Focus>,
     quit: bool,
 }
 
 impl App {
-    pub fn new(shared: Shared, modes: Vec<Box<dyn Mode>>) -> Self {
+    pub fn new(shared: Shared, files: FilesMode, term: TerminalMode) -> Self {
         let leader = KeyChord::parse(&shared.config.leader).unwrap_or_else(|| {
             tracing::warn!(leader = %shared.config.leader, "invalid leader key, using ctrl-]");
             KeyChord::parse("ctrl-]").expect("valid default")
@@ -64,10 +129,12 @@ impl App {
         // The demo keeps its Run history in memory only.
         let run_history =
             if shared.state.is_persistent() { crate::run::History::load_default() } else { crate::run::History::default() };
+        let workspaces = vec![Workspace::new(files.path(0).to_path_buf(), Focus::Files)];
         Self {
             shared,
-            modes,
-            active_mode: 0,
+            files,
+            term,
+            workspaces,
             leader,
             leader_pending: false,
             menu: None,
@@ -77,6 +144,7 @@ impl App {
             toast: None,
             chrome_hits: HitMap::default(),
             layout: AppLayout::default(),
+            mouse_owner: None,
             quit: false,
         }
     }
@@ -87,6 +155,7 @@ impl App {
         let mut dirty = true;
         while !self.quit {
             if dirty {
+                self.sync_folders();
                 terminal.draw(|f| self.render(f))?;
                 dirty = false;
             }
@@ -109,10 +178,35 @@ impl App {
                         self.toast = None;
                         dirty = true;
                     }
+                    // Programs starting and exiting in the terminals (and pending `cd`s).
+                    if self.term.poll() {
+                        dirty = true;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    fn active(&self) -> usize {
+        self.files.active_tab()
+    }
+
+    fn ws(&mut self) -> &mut Workspace {
+        let i = self.active();
+        &mut self.workspaces[i]
+    }
+
+    /// The terminal follows the Files pane: any tab whose folder changed (navigation, a
+    /// moved or deleted folder) sends its shell a `cd`.
+    fn sync_folders(&mut self) {
+        for (i, ws) in self.workspaces.iter_mut().enumerate() {
+            let path = self.files.path(i);
+            if ws.synced != path {
+                ws.synced = path.to_path_buf();
+                self.term.follow(i, path);
+            }
+        }
     }
 
     // ---- Rendering ----
@@ -120,32 +214,55 @@ impl App {
     fn render(&mut self, f: &mut Frame) {
         let theme = &self.shared.theme;
         f.render_widget(Paragraph::new("").style(Style::new().bg(theme.bg).fg(theme.fg)), f.area());
-        let mode = &mut self.modes[self.active_mode];
-        self.layout = AppLayout::new(f.area(), mode.toolbar_height());
+        let i = self.active();
+        let (size, focus) = (self.workspaces[i].size, self.workspaces[i].focus());
+        self.layout = AppLayout::new(f.area(), self.files.toolbar_height(), size);
         self.chrome_hits.clear();
+        self.files.focused = focus == Focus::Files;
+        self.term.focused = focus == Focus::Term;
 
-        let tabs = mode.tabs();
-        bars::render_tab_bar(f, self.layout.tab_bar, theme, mode.icon(), &tabs, mode.active_tab(), &mut self.chrome_hits);
-        if self.layout.toolbar.height > 0 {
-            mode.render_toolbar(f, self.layout.toolbar, &self.shared);
+        let tabs: Vec<TabInfo> = (0..self.files.tab_count())
+            .map(|t| TabInfo { title: self.files.title(t), busy: self.term.busy(t).is_some() })
+            .collect();
+        bars::render_tab_bar(f, self.layout.tab_bar, theme, "▤", &tabs, i, &mut self.chrome_hits);
+
+        if self.layout.files_pane().height > 0 {
+            if self.layout.toolbar.height > 0 {
+                self.files.render_toolbar(f, self.layout.toolbar, &self.shared);
+            }
+            self.files.render(f, self.layout.files, &self.shared);
         }
-        mode.render(f, self.layout.content, &self.shared);
+        // The demo's shell runs in a real folder of this machine: show the sample one instead.
+        let dir = if self.shared.demo { self.files.path(i).to_path_buf() } else { self.term.shown_dir(i) };
+        let header = TermHeader {
+            dir: &dir,
+            focused: focus == Focus::Term,
+            size,
+            busy: self.term.busy(i),
+            pending: self.term.pending(i),
+            follows: self.files.path(i).is_dir(),
+        };
+        bars::render_term_header(f, self.layout.term_header, theme, &header, &mut self.chrome_hits);
+        if self.layout.term.height > 0 {
+            self.term.render(f, self.layout.term, &self.shared);
+        }
 
-        let mut status = mode.status(&self.shared);
+        let mut status = match focus {
+            Focus::Files => self.files.status(&self.shared),
+            Focus::Term => self.term.status(&self.shared),
+        };
         if self.leader_pending {
             status = format!(
-                "{}: t new · w close · n/p next/prev · 1-9 mode · ? menu · q quit",
+                "{}: t new · w close · n/p next/prev · ` focus · z size · ? menu · q quit",
                 crate::keys::display(&self.shared.config.leader)
             );
         }
-        let mode_list: Vec<(String, String)> =
-            self.modes.iter().map(|m| (m.icon().to_string(), m.name().to_string())).collect();
-        let hints = self.modes[self.active_mode].hints(&self.shared);
-        let bar = bars::BottomBar { modes: &mode_list, active: self.active_mode, status: &status, hints: &hints };
-        bars::render_bottom_bar(f, self.layout.bottom_bar, theme, &bar, &mut self.chrome_hits);
+        let leader = crate::keys::display(&self.shared.config.leader);
+        bars::render_bottom_bar(f, self.layout.bottom_bar, theme, &status, &leader, &mut self.chrome_hits);
 
         if let Some(toast) = &self.toast {
-            let mut area = self.layout.content;
+            // Above the terminal header when Files is visible, else at the bottom of the terminal.
+            let mut area = if self.layout.files.height > 0 { self.layout.files } else { self.layout.term };
             area.height = area.height.saturating_sub(1);
             toast.render(f, area, theme);
         }
@@ -162,20 +279,23 @@ impl App {
 
     // ---- Effects ----
 
-    /// Runs `f` against mode `idx` with a fresh context and applies the effects it produced.
-    fn with_mode<R>(&mut self, idx: usize, f: impl FnOnce(&mut dyn Mode, &mut ModeCtx) -> R) -> R {
+    /// Runs `f` against a pane with a fresh context and applies the effects it produced.
+    fn with_pane<R>(&mut self, pane: Focus, f: impl FnOnce(&mut dyn Pane, &mut ModeCtx) -> R) -> R {
         let mut effects = Vec::new();
         let result = {
             let mut ctx = ModeCtx::new(&self.shared, &mut effects);
-            f(self.modes[idx].as_mut(), &mut ctx)
+            let p: &mut dyn Pane = match pane {
+                Focus::Files => &mut self.files,
+                Focus::Term => &mut self.term,
+            };
+            f(p, &mut ctx)
         };
-        let mut requests = Vec::new();
         for effect in effects {
             match effect {
-                Effect::Request(req) => requests.push(req),
+                Effect::Request(req) => self.handle_request(req.as_ref()),
                 Effect::Confirm(c) => {
                     self.menu = None;
-                    self.dialog = Some(DialogState::new(idx, c));
+                    self.dialog = Some(DialogState::new(pane as usize, c));
                 }
                 Effect::Toast { msg, detail } => self.toast = Some(Toast::new(msg, detail)),
                 Effect::Run(prompt) => {
@@ -184,29 +304,30 @@ impl App {
                     self.run_dialog = Some(RunDialogState::new(prompt, history));
                 }
                 Effect::OpenMenu { x, y, items } => {
-                    self.menu = (!items.is_empty()).then(|| MenuState::new(MenuOwner::Mode(idx), (x, y), items));
+                    self.menu = (!items.is_empty()).then(|| MenuState::new(MenuOwner::Mode(pane as usize), (x, y), items));
                 }
             }
-        }
-        for req in requests {
-            self.route_request(req.as_ref());
         }
         result
     }
 
-    fn route_request(&mut self, req: &dyn std::any::Any) {
-        for i in 0..self.modes.len() {
-            if self.with_mode(i, |m, ctx| m.handle_request(req, ctx)) {
-                self.switch_mode(i);
-                return;
-            }
+    fn handle_request(&mut self, req: &dyn std::any::Any) {
+        if let Some(r) = req.downcast_ref::<OpenTab>() {
+            self.open_tab(r.cwd.clone(), None);
+        } else if let Some(r) = req.downcast_ref::<ShowInFiles>() {
+            // The shell is already there: no `cd` back.
+            self.files.show(r.path.clone());
+            let ws = self.ws();
+            ws.synced = r.path.clone();
+            ws.set_focus(Focus::Files);
+        } else {
+            tracing::warn!("unknown request");
         }
-        tracing::warn!("no mode handled a request");
     }
 
     fn dispatch_app_event(&mut self, ev: AppEvent) {
-        for i in 0..self.modes.len() {
-            if self.with_mode(i, |m, ctx| m.handle_app_event(&ev, ctx)) == EventResult::Consumed {
+        for pane in [Focus::Files, Focus::Term] {
+            if self.with_pane(pane, |p, ctx| p.handle_app_event(&ev, ctx)) == EventResult::Consumed {
                 break;
             }
         }
@@ -229,8 +350,8 @@ impl App {
                 }
             }
             Event::Paste(text) if self.menu.is_none() => {
-                let i = self.active_mode;
-                self.with_mode(i, |m, ctx| m.handle_paste(&text, ctx));
+                let focus = self.ws().focus();
+                self.with_pane(focus, |p, ctx| p.handle_paste(&text, ctx));
             }
             _ => {}
         }
@@ -288,18 +409,18 @@ impl App {
             return;
         }
 
-        // Ctrl+Q quits from any mode, even when a terminal has focus.
+        // Ctrl+Q quits from anywhere, even when a terminal has focus.
         if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL {
             self.quit = true;
             return;
         }
 
+        let focus = self.ws().focus();
         if self.leader_pending {
             self.leader_pending = false;
             if self.leader.matches(&key) {
-                // Pressing the leader twice sends it to the mode.
-                let i = self.active_mode;
-                self.with_mode(i, |m, ctx| m.handle_key(key, ctx));
+                // Pressing the leader twice sends it to the pane.
+                self.with_pane(focus, |p, ctx| p.handle_key(key, ctx));
             } else {
                 self.leader_command(key);
             }
@@ -310,11 +431,14 @@ impl App {
             return;
         }
 
-        let i = self.active_mode;
-        if self.with_mode(i, |m, ctx| m.handle_key(key, ctx)) == EventResult::Consumed {
+        if self.with_pane(focus, |p, ctx| p.handle_key(key, ctx)) == EventResult::Consumed {
             return;
         }
-        if !self.modes[i].captures_input() {
+        let captures = match focus {
+            Focus::Files => self.files.captures_input(),
+            Focus::Term => self.term.captures_input(),
+        };
+        if !captures {
             self.global_shortcut(key);
         }
     }
@@ -322,38 +446,44 @@ impl App {
     fn leader_command(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('t') | KeyCode::Char('c') => self.new_tab(),
-            KeyCode::Char('w') | KeyCode::Char('x') => self.close_tab(self.modes[self.active_mode].active_tab()),
+            KeyCode::Char('w') | KeyCode::Char('x') => self.close_tab(self.active()),
             KeyCode::Char('n') | KeyCode::Right => self.cycle_tab(1),
             KeyCode::Char('p') | KeyCode::Left => self.cycle_tab(-1),
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char(c @ '1'..='9') => self.switch_mode(c as usize - '1' as usize),
-            KeyCode::Char('m') | KeyCode::Tab => self.switch_mode((self.active_mode + 1) % self.modes.len()),
+            KeyCode::Char('`') | KeyCode::Tab => self.swap_focus(),
+            KeyCode::Char('z') => self.cycle_size(),
             KeyCode::Char('?') | KeyCode::Char(' ') => self.open_shortcuts_menu_from_keyboard(),
-            // The mode's own shortcut items, by the key shown as their hint (e.g. `f` in Terminal).
+            // The panes' own shortcut items, by the key shown as their hint (`f`, `.`, `r`).
             KeyCode::Char(c) => {
                 let wanted = c.to_string();
-                let action = self.modes[self.active_mode].shortcut_items().into_iter().find_map(|it| match it {
-                    crate::modes::MenuItem::Action { hint, enabled: true, action, .. } if hint == wanted => Some(action),
-                    _ => None,
-                });
-                if let Some(action) = action {
-                    let i = self.active_mode;
-                    self.with_mode(i, |m, ctx| m.on_action(action, ctx));
+                for pane in [Focus::Term, Focus::Files] {
+                    let items = match pane {
+                        Focus::Files => self.files.shortcut_items(),
+                        Focus::Term => self.term.shortcut_items(),
+                    };
+                    let action = items.into_iter().find_map(|it| match it {
+                        MenuItem::Action { hint, enabled: true, action, .. } if hint == wanted => Some(action),
+                        _ => None,
+                    });
+                    if let Some(action) = action {
+                        self.with_pane(pane, |p, ctx| p.on_action(action, ctx));
+                        return;
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    /// Shortcuts for modes that do not capture every key.
+    /// Shortcuts while the Files pane has the focus (it does not capture every key).
     fn global_shortcut(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('t') if ctrl => self.new_tab(),
-            KeyCode::Char('w') if ctrl => self.close_tab(self.modes[self.active_mode].active_tab()),
+            KeyCode::Char('w') if ctrl => self.close_tab(self.active()),
             KeyCode::Tab => self.cycle_tab(1),
             KeyCode::BackTab => self.cycle_tab(-1),
-            KeyCode::F(n @ 1..=9) => self.switch_mode(n as usize - 1),
+            KeyCode::Char('`') => self.swap_focus(),
             KeyCode::Char('?') => self.open_shortcuts_menu_from_keyboard(),
             KeyCode::Char('q') if key.modifiers.is_empty() => self.quit = true,
             _ => {}
@@ -415,71 +545,111 @@ impl App {
             }
         }
 
-        let on_chrome = |r: ratatui::layout::Rect| r.contains((x, y).into());
-        if matches!(ev.kind, MouseEventKind::Down(_)) && (on_chrome(self.layout.tab_bar) || on_chrome(self.layout.bottom_bar)) {
+        let inside = |r: Rect| r.contains((x, y).into());
+        let l = self.layout;
+        if matches!(ev.kind, MouseEventKind::Down(_)) && (inside(l.tab_bar) || inside(l.bottom_bar) || inside(l.term_header)) {
             if ev.kind == MouseEventKind::Down(MouseButton::Left) {
-                match self.chrome_hits.hit(x, y) {
-                    Some(ChromeTarget::Tab(i)) => self.modes[self.active_mode].select_tab(i),
-                    Some(ChromeTarget::CloseTab(i)) => self.close_tab(i),
-                    Some(ChromeTarget::NewTab) => self.new_tab(),
-                    Some(ChromeTarget::Mode(i)) => self.switch_mode(i),
-                    Some(ChromeTarget::Quit) => self.quit = true,
-                    Some(ChromeTarget::Shortcuts) => self.open_shortcuts_menu(x, y),
-                    Some(ChromeTarget::Hint(action)) => {
-                        let i = self.active_mode;
-                        self.with_mode(i, |m, ctx| m.on_action(action, ctx));
-                    }
-                    None => {}
-                }
+                self.chrome_click(x, y);
             }
             return;
         }
-        let i = self.active_mode;
-        self.with_mode(i, |m, ctx| m.handle_mouse(ev, ctx));
+
+        // Drags and releases go to the pane the button went down in.
+        let pane = match ev.kind {
+            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => self.mouse_owner,
+            _ if inside(l.files_pane()) => Some(Focus::Files),
+            _ if inside(l.term) => Some(Focus::Term),
+            _ => None,
+        };
+        let Some(pane) = pane else { return };
+        match ev.kind {
+            MouseEventKind::Down(_) => {
+                self.mouse_owner = Some(pane);
+                // Clicking a pane gives it the keys (scrolling does not).
+                self.ws().set_focus(pane);
+            }
+            MouseEventKind::Up(_) => self.mouse_owner = None,
+            _ => {}
+        }
+        self.with_pane(pane, |p, ctx| p.handle_mouse(ev, ctx));
+    }
+
+    fn chrome_click(&mut self, x: u16, y: u16) {
+        match self.chrome_hits.hit(x, y) {
+            Some(ChromeTarget::Tab(i)) => self.select_tab(i),
+            Some(ChromeTarget::CloseTab(i)) => self.close_tab(i),
+            Some(ChromeTarget::NewTab) => self.new_tab(),
+            Some(ChromeTarget::TermTitle) => {
+                let ws = self.ws();
+                let size = if ws.size == TermSize::Min { TermSize::Normal } else { TermSize::Min };
+                ws.set_size(size);
+            }
+            Some(ChromeTarget::TermSize(size)) => self.ws().set_size(size),
+            Some(ChromeTarget::Quit) => self.quit = true,
+            Some(ChromeTarget::Shortcuts) => self.open_shortcuts_menu(x, y),
+            None => {}
+        }
     }
 
     fn run_menu_action(&mut self, action: u32) {
         if let Some(menu) = self.menu.take() {
             match menu.owner {
-                MenuOwner::Mode(i) => self.with_mode(i, |m, ctx| m.on_action(action, ctx)),
+                MenuOwner::Mode(i) => {
+                    self.with_pane(Focus::from_index(i), |p, ctx| p.on_action(action, ctx));
+                }
                 MenuOwner::App => self.run_app_action(action),
             }
         }
     }
 
-    /// The leader-key commands as a clickable menu, each with its key as the hint.
+    /// The tab, focus and size commands plus both panes' own items, each with its key.
     fn open_shortcuts_menu(&mut self, x: u16, _y: u16) {
-        use crate::modes::MenuItem;
-        let mode = &self.modes[self.active_mode];
-        let closable = mode.tabs().len() > 1;
-        // Modes that capture input (Terminal) use the keys after the leader; the others
-        // also have direct shortcuts (see `global_shortcut`), which are shorter to show.
-        let leader = mode.captures_input();
-        let key = |after_leader: &str, direct: &str| if leader { after_leader.to_string() } else { direct.to_string() };
+        let closable = self.files.tab_count() > 1;
+        let focus = self.ws().focus();
+        // In the terminal every key goes to the shell, so its keys come after the leader;
+        // Files also has direct shortcuts (see `global_shortcut`), which are shorter to show.
+        let leader = crate::keys::display(&self.shared.config.leader);
+        let in_term = focus == Focus::Term;
+        let key = |after_leader: &str, direct: &str| if in_term { after_leader.to_string() } else { direct.to_string() };
+        let leader_only = |k: &str| if in_term { k.to_string() } else { format!("{leader} {k}") };
+        let swap = if in_term { "Focus Files" } else { "Focus terminal" };
+        let size = match self.ws().size {
+            TermSize::Min => "minimized",
+            TermSize::Normal => "half",
+            TermSize::Full => "full",
+        };
         let mut items = vec![
             MenuItem::action("New tab", app_action::NEW_TAB).with_hint(key("t", "Ctrl-t")),
             MenuItem::action("Close tab", app_action::CLOSE_TAB).with_hint(key("w", "Ctrl-w")).enabled(closable),
             MenuItem::action("Next tab", app_action::NEXT_TAB).with_hint(key("n", "Tab")),
             MenuItem::action("Previous tab", app_action::PREV_TAB).with_hint(key("p", "Shift-Tab")),
             MenuItem::Separator,
+            MenuItem::action(swap, app_action::SWAP_FOCUS).with_hint("`"),
+            MenuItem::action(format!("Terminal size: {size}"), app_action::CYCLE_SIZE).with_hint(leader_only("z")),
+            MenuItem::Separator,
         ];
-        let own = mode.shortcut_items();
-        if !own.is_empty() {
+        let base = app_action::PANE_ACTION_BASE;
+        // Files keys work directly in Files and after the leader in the terminal.
+        let files_items = self.files.shortcut_items();
+        let term_items: Vec<MenuItem> = self
+            .term
+            .shortcut_items()
+            .into_iter()
+            .map(|it| match it {
+                MenuItem::Action { label, hint, enabled, danger, action } => {
+                    MenuItem::Action { label, hint: leader_only(&hint), enabled, danger, action }
+                }
+                sep => sep,
+            })
+            .collect();
+        for (pane, own) in [(Focus::Files, files_items), (Focus::Term, term_items)] {
+            let offset = base * (pane as u32 + 1);
             items.extend(own.into_iter().map(|it| match it {
                 MenuItem::Action { label, hint, enabled, danger, action } => {
-                    MenuItem::Action { label, hint, enabled, danger, action: app_action::MODE_ACTION_BASE + action }
+                    MenuItem::Action { label, hint, enabled, danger, action: offset + action }
                 }
                 sep => sep,
             }));
-            items.push(MenuItem::Separator);
-        }
-        for (i, m) in self.modes.iter().enumerate().take(9) {
-            if i != self.active_mode {
-                items.push(
-                    MenuItem::action(format!("Switch to {}", m.name()), app_action::MODE_BASE + i as u32)
-                        .with_hint(key(&(i + 1).to_string(), &format!("F{}", i + 1))),
-                );
-            }
         }
         items.push(MenuItem::Separator);
         items.push(MenuItem::action("Quit", app_action::QUIT).with_hint(key("q", "q")));
@@ -487,29 +657,30 @@ impl App {
         self.menu = Some(MenuState::new(MenuOwner::App, (x.saturating_sub(4), top_of_bar), items).above());
     }
 
-    /// Opens the shortcuts menu at the right of the bottom bar, where its hint is.
+    /// Opens the shortcuts menu at the right of the bottom bar, where its button is.
     fn open_shortcuts_menu_from_keyboard(&mut self) {
-        let x = self.layout.bottom_bar.right().saturating_sub(34);
+        let x = self.layout.bottom_bar.right().saturating_sub(40);
         self.open_shortcuts_menu(x + 4, self.layout.bottom_bar.y);
     }
 
     fn run_app_action(&mut self, action: u32) {
+        let base = app_action::PANE_ACTION_BASE;
         match action {
             app_action::NEW_TAB => self.new_tab(),
-            app_action::CLOSE_TAB => self.close_tab(self.modes[self.active_mode].active_tab()),
+            app_action::CLOSE_TAB => self.close_tab(self.active()),
             app_action::NEXT_TAB => self.cycle_tab(1),
             app_action::PREV_TAB => self.cycle_tab(-1),
             app_action::QUIT => self.quit = true,
-            a if a >= app_action::MODE_ACTION_BASE => {
-                let i = self.active_mode;
-                self.with_mode(i, |m, ctx| m.on_action(a - app_action::MODE_ACTION_BASE, ctx));
-            }
-            a if a >= app_action::MODE_BASE => self.switch_mode((a - app_action::MODE_BASE) as usize),
+            app_action::SWAP_FOCUS => self.swap_focus(),
+            app_action::CYCLE_SIZE => self.cycle_size(),
+            a if a >= 2 * base => self.with_pane(Focus::Term, |p, ctx| p.on_action(a - 2 * base, ctx)),
+            a if a >= base => self.with_pane(Focus::Files, |p, ctx| p.on_action(a - base, ctx)),
             _ => {}
         }
     }
 
-    /// Enter / Run in the Run dialog: types the command into a new terminal tab.
+    /// Enter / Run in the Run dialog: types the command into this tab's terminal, or into a
+    /// new tab in the same folder when a program is running there.
     fn submit_run(&mut self) {
         let Some(run) = &mut self.run_dialog else { return };
         match run.submit() {
@@ -518,8 +689,15 @@ impl App {
                 let Some(run) = self.run_dialog.take() else { return };
                 let p = run.prompt;
                 self.run_history.record(&p.key, &prefix, &args);
-                let label = crate::run::tab_label(&prefix, &p.paths);
-                self.route_request(&crate::modes::requests::OpenTerminal { cwd: p.cwd, command: Some(command), label: Some(label) });
+                let i = self.active();
+                let busy = self.term.busy(i).map(str::to_string);
+                if busy.is_none() && self.term.run_in(i, &command) {
+                    self.ws().set_focus(Focus::Term);
+                    return;
+                }
+                let why = busy.unwrap_or_else(|| "the shell exited".into());
+                self.open_tab(p.cwd, Some(command.clone()));
+                self.toast = Some(Toast::new(format!("Terminal busy ({why}), opened a new tab"), command));
             }
         }
     }
@@ -527,37 +705,88 @@ impl App {
     fn accept_dialog(&mut self) {
         if let Some(d) = self.dialog.take() {
             let action = d.confirm.action;
-            self.with_mode(d.mode, |m, ctx| m.on_action(action, ctx));
+            self.with_pane(Focus::from_index(d.mode), |p, ctx| p.on_action(action, ctx));
         }
     }
 
-    // ---- Tabs and modes ----
+    // ---- Tabs, focus and terminal size ----
 
+    /// A new tab (Files + terminal) in `cwd`, at the end; `typed` runs once its shell is ready.
+    fn open_tab(&mut self, cwd: PathBuf, typed: Option<String>) {
+        let focus = if typed.is_some() { Focus::Term } else { Focus::Files };
+        // The shell starts in `cwd` when it exists on disk (not in the demo file system).
+        let shell_dir = if cwd.is_dir() { cwd.clone() } else { self.term.shown_dir(self.active()) };
+        self.files.open_tab(cwd.clone());
+        self.term.open_tab(shell_dir, typed);
+        self.workspaces.push(Workspace::new(cwd, focus));
+        self.menu = None;
+    }
+
+    /// A new tab in the current tab's folder.
     fn new_tab(&mut self) {
-        let i = self.active_mode;
-        self.with_mode(i, |m, ctx| m.new_tab(ctx));
+        let cwd = self.files.path(self.active()).to_path_buf();
+        self.open_tab(cwd, None);
     }
 
     fn close_tab(&mut self, idx: usize) {
-        let i = self.active_mode;
-        if self.modes[i].tabs().len() > 1 {
-            self.with_mode(i, |m, ctx| m.close_tab(idx, ctx));
+        if self.files.tab_count() > 1 && idx < self.workspaces.len() {
+            self.files.close_tab(idx);
+            self.term.close_tab(idx);
+            self.workspaces.remove(idx);
+            self.menu = None;
         }
+    }
+
+    fn select_tab(&mut self, idx: usize) {
+        self.files.select_tab(idx);
+        self.term.select_tab(idx);
+        self.menu = None;
     }
 
     fn cycle_tab(&mut self, delta: i32) {
-        let mode = &mut self.modes[self.active_mode];
-        let n = mode.tabs().len() as i32;
+        let n = self.files.tab_count() as i32;
         if n > 0 {
-            let next = (mode.active_tab() as i32 + delta).rem_euclid(n);
-            mode.select_tab(next as usize);
+            let next = (self.active() as i32 + delta).rem_euclid(n);
+            self.select_tab(next as usize);
         }
     }
 
-    fn switch_mode(&mut self, idx: usize) {
-        if idx < self.modes.len() {
-            self.active_mode = idx;
-            self.menu = None;
-        }
+    fn swap_focus(&mut self) {
+        let ws = self.ws();
+        let next = if ws.focus() == Focus::Files { Focus::Term } else { Focus::Files };
+        ws.set_focus(next);
+    }
+
+    fn cycle_size(&mut self) {
+        let ws = self.ws();
+        let next = ws.size.next();
+        ws.set_size(next);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_follows_the_terminal_size() {
+        let mut ws = Workspace::new(PathBuf::from("/"), Focus::Files);
+        ws.set_size(TermSize::Full);
+        assert_eq!(ws.focus(), Focus::Term);
+        // Focusing Files from full screen brings the Files pane back.
+        ws.set_focus(Focus::Files);
+        assert_eq!((ws.size, ws.focus()), (TermSize::Normal, Focus::Files));
+        ws.set_size(TermSize::Min);
+        assert_eq!(ws.focus(), Focus::Files);
+        // Focusing a minimized terminal opens it.
+        ws.set_focus(Focus::Term);
+        assert_eq!((ws.size, ws.focus()), (TermSize::Normal, Focus::Term));
+    }
+
+    #[test]
+    fn sizes_cycle() {
+        assert_eq!(TermSize::Min.next(), TermSize::Normal);
+        assert_eq!(TermSize::Normal.next(), TermSize::Full);
+        assert_eq!(TermSize::Full.next(), TermSize::Min);
     }
 }

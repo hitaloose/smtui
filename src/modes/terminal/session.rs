@@ -162,6 +162,35 @@ impl TerminalSession {
         [foreground, self.child.process_id()].into_iter().flatten().find_map(process_cwd)
     }
 
+    /// True when the shell itself is in the foreground (at its prompt), not a program it
+    /// started (vim, `tail -f`, a nested shell…). Unknown counts as busy.
+    pub fn is_idle(&self) -> bool {
+        match (self.master.process_group_leader(), self.child.process_id()) {
+            (Some(fg), Some(shell)) => u32::try_from(fg).ok() == Some(shell),
+            _ => false,
+        }
+    }
+
+    /// Process group in the foreground, when it is not the shell (cheap: one ioctl).
+    pub fn foreground_job(&self) -> Option<u32> {
+        if self.is_idle() {
+            return None;
+        }
+        Some(self.master.process_group_leader().and_then(|p| u32::try_from(p).ok()).unwrap_or(0))
+    }
+
+    /// The shell's own folder, only where that is cheap to read (`/proc` on Linux).
+    pub fn shell_cwd(&self) -> Option<PathBuf> {
+        let pid = self.child.process_id()?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    /// Replaces whatever is typed at the prompt with `line` and runs it. Only call this
+    /// when [`Self::is_idle`]: Ctrl-E Ctrl-U clears the line in bash, zsh and fish.
+    pub fn type_line(&mut self, line: &str) {
+        self.write(format!("\x05\x15{line}\r").as_bytes());
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -200,6 +229,24 @@ impl Drop for TerminalSession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Name of process `pid`: `/proc` on Linux, `ps` elsewhere.
+pub fn process_name(pid: u32) -> Option<String> {
+    let name = match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(name) => name,
+        Err(_) => {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "comm=", "-p", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+    };
+    // `ps` may print a full path (macOS).
+    let name = name.trim().rsplit('/').next().unwrap_or("").to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Current folder of process `pid`: `/proc` on Linux, `lsof` elsewhere (macOS, for development).
